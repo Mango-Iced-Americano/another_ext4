@@ -582,7 +582,7 @@ impl Ext4 {
             || inode_table >= sb.block_count()
             || inode_table
                 .checked_add(inode_table_blocks)
-                .is_none_or(|end| end > sb.block_count())
+                .map_or(true, |end| end > sb.block_count())
         {
             return_error!(ErrCode::EIO, "Invalid ext4 block-group descriptor");
         }

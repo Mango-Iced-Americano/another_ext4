@@ -251,7 +251,7 @@ impl Ext4 {
         let blocks_in_group = Self::block_group_block_count(&sb, bgid);
         if bit
             .checked_add(count)
-            .is_none_or(|end| end > blocks_in_group)
+            .map_or(true, |end| end > blocks_in_group)
         {
             return_error!(ErrCode::EINVAL, "Block range exceeds block group");
         }

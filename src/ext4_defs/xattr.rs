@@ -136,7 +136,7 @@ pub fn validate_xattr_block_for_release(block: &[u8]) -> Option<(XattrHeader, bo
         // terminator. This mirrors Linux's `EXT4_XATTR_NEXT(e) >= end` check.
         if next_entry
             .checked_add(size_of::<u32>())
-            .is_none_or(|end| end > BLOCK_SIZE)
+            .map_or(true, |end| end > BLOCK_SIZE)
         {
             return None;
         }
