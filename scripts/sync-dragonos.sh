@@ -27,7 +27,7 @@ git -C "$temporary_clone/dragonos" cat-file -e "$source_commit:$source_prefix"
 git -C "$temporary_clone/dragonos" checkout --detach "$source_commit"
 
 split_commit="$(git -C "$temporary_clone/dragonos" subtree split --prefix="$source_prefix" "$source_commit")"
-git fetch "$temporary_clone/dragonos" "$split_commit:refs/heads/$tracking_branch"
+git fetch --no-tags "$temporary_clone/dragonos" "$split_commit:refs/heads/$tracking_branch"
 
 printf '%s\n' "source_commit=$source_commit"
 printf '%s\n' "source_prefix=$source_prefix"
