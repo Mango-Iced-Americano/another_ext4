@@ -351,7 +351,7 @@ pub fn parse_revoke_records(
         return malformed("JBD2 revoke byte count is out of range");
     }
     let width = if features.has_64bit { 8 } else { 4 };
-    if !(count - 16).is_multiple_of(width) {
+    if (count - 16) % width != 0 {
         return malformed("misaligned JBD2 revoke records");
     }
     let mut records = Vec::with_capacity((count - 16) / width);
@@ -569,6 +569,21 @@ mod tests {
             parse_revoke_records(&block, features, 3, 1u64 << 34).unwrap(),
             [0x0000_0001_0000_0002]
         );
+    }
+
+    #[test]
+    fn revoke_records_reject_misaligned_record_area() {
+        // Given: a revoke block whose record region has one extra byte.
+        let features = Features::validate(0, FEATURE_INCOMPAT_REVOKE, 0).unwrap();
+        let mut block = [0; 32];
+        header(&mut block, BlockType::Revoke, 3);
+        block[12..16].copy_from_slice(&17u32.to_be_bytes());
+
+        // When: its records are parsed.
+        let error = parse_revoke_records(&block, features, 3, 16).unwrap_err();
+
+        // Then: the malformed alignment is rejected.
+        assert_eq!(error.code(), ErrCode::EIO);
     }
 
     #[test]

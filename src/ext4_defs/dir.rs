@@ -262,7 +262,7 @@ impl DirBlock {
             let name_len = self.0.data[offset + 6] as usize;
             let file_type = self.0.data[offset + 7];
             if rec_len < size_of::<FakeDirEntry>()
-                || !rec_len.is_multiple_of(4)
+                || rec_len % 4 != 0
                 || offset.checked_add(rec_len).is_none_or(|end| end > data_end)
                 || name_len > rec_len - size_of::<FakeDirEntry>()
                 || file_type > FileType::SymLink as u8
@@ -654,6 +654,22 @@ mod tests {
                 .code(),
             ErrCode::EIO
         );
+    }
+
+    #[test]
+    fn validated_leaf_rejects_unaligned_record_length() {
+        // Given: a leaf entry with a valid minimum size but invalid 4-byte alignment.
+        let block = valid_block();
+        let mut unaligned = block.0.clone();
+        unaligned.data[4..6].copy_from_slice(&9u16.to_le_bytes());
+
+        // When: the leaf directory block is validated without checksum coverage.
+        let error = DirBlock::new(unaligned)
+            .validate(seed(), 2, 9, false, false, false)
+            .unwrap_err();
+
+        // Then: the malformed record is rejected.
+        assert_eq!(error.code(), ErrCode::EIO);
     }
 
     #[test]

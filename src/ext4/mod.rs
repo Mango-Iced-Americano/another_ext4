@@ -370,7 +370,7 @@ impl Ext4 {
     }
 
     fn is_power_of(mut value: u32, base: u32) -> bool {
-        while value > base && value.is_multiple_of(base) {
+        while value > base && value % base == 0 {
             value /= base;
         }
         value == base

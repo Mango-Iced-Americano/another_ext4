@@ -72,7 +72,7 @@ impl Ext4 {
 
     fn dir_data_block_count(dir: &InodeRef) -> Result<u32> {
         let size = dir.inode.size();
-        if !size.is_multiple_of(BLOCK_SIZE as u64) {
+        if size % BLOCK_SIZE as u64 != 0 {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
         u32::try_from(size / BLOCK_SIZE as u64).map_err(|_| Ext4Error::new(ErrCode::EIO))
@@ -515,5 +515,24 @@ impl Ext4 {
             name == "." || name == ".."
         });
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ext4_defs::Inode;
+
+    #[test]
+    fn directory_data_block_count_rejects_unaligned_inode_size() {
+        // Given: a directory inode whose data size includes a partial block.
+        let mut dir = InodeRef::new(12, Box::<Inode>::default());
+        dir.inode.set_size(BLOCK_SIZE as u64 + 1);
+
+        // When: the directory block count is requested.
+        let error = Ext4::dir_data_block_count(&dir).unwrap_err();
+
+        // Then: the malformed directory size is rejected.
+        assert_eq!(error.code(), ErrCode::EIO);
     }
 }

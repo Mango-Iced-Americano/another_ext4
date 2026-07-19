@@ -83,7 +83,7 @@ pub trait BlockDevice: Send + Sync + Any {
     /// Read a contiguous physical block range into an exact-sized buffer.
     /// Devices may override this to submit fewer, larger requests.
     fn read_blocks(&self, start: PBlockId, data: &mut [u8]) -> Result<()> {
-        if data.is_empty() || !data.len().is_multiple_of(BLOCK_SIZE) {
+        if data.is_empty() || data.len() % BLOCK_SIZE != 0 {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
         for (index, chunk) in data.chunks_exact_mut(BLOCK_SIZE).enumerate() {
@@ -98,7 +98,7 @@ pub trait BlockDevice: Send + Sync + Any {
     /// Write an exact-sized buffer to a contiguous physical block range.
     /// The default preserves the existing one-block-at-a-time semantics.
     fn write_blocks(&self, start: PBlockId, data: &[u8]) -> Result<()> {
-        if data.is_empty() || !data.len().is_multiple_of(BLOCK_SIZE) {
+        if data.is_empty() || data.len() % BLOCK_SIZE != 0 {
             return Err(Ext4Error::new(ErrCode::EINVAL));
         }
         for (index, chunk) in data.chunks_exact(BLOCK_SIZE).enumerate() {
