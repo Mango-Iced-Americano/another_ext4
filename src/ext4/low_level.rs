@@ -289,6 +289,7 @@ impl Ext4 {
 
         FileAttr {
             ino: inode.id,
+            generation: inode.inode.generation(),
             size: inode.inode.size(),
             blocks: inode.inode.block_count(),
             atime: inode.inode.atime(),

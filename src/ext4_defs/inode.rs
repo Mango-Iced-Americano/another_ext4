@@ -526,6 +526,10 @@ impl InodeReclaimHandle {
     pub fn inode_id(&self) -> InodeId {
         self.inode_id
     }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 impl InodeRef {
@@ -564,6 +568,8 @@ impl InodeRef {
 #[derive(Debug, Clone)]
 pub struct FileAttr {
     pub ino: InodeId,
+    /// On-disk ext4 lifetime generation for this inode-table slot.
+    pub generation: u32,
     pub size: u64,
     pub atime: u32,
     pub mtime: u32,
