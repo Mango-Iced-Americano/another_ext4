@@ -102,6 +102,13 @@ impl Ext4 {
             || range.block_count < DIRECT_RANGE_MIN_BLOCKS
             || range.block_count > DIRECT_RANGE_MAX_BLOCKS
         {
+            crate::println!(
+                "[ext4_diag] plan_reject:out_of_bounds lblock={} count={} min={} max={}",
+                range.first_lblock,
+                range.block_count,
+                DIRECT_RANGE_MIN_BLOCKS,
+                DIRECT_RANGE_MAX_BLOCKS
+            );
             return Ok(None);
         }
         let persistent_blocks = inode
@@ -111,11 +118,29 @@ impl Ext4 {
             .map(|size| size / BLOCK_SIZE as u64)
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
         if (range.first_lblock as u64) < persistent_blocks {
+            crate::println!(
+                "[ext4_diag] plan_reject:before_eof lblock={} persistent={} count={}",
+                range.first_lblock,
+                persistent_blocks,
+                range.block_count
+            );
             return Ok(None);
         }
         let Some(shape) = self.direct_append_shape(inode, range.first_lblock, count)? else {
+            crate::println!(
+                "[ext4_diag] plan_reject:append_shape lblock={} count={} size={}",
+                range.first_lblock,
+                count,
+                inode.inode.size()
+            );
             return Ok(None);
         };
+        crate::println!(
+            "[ext4_diag] plan_accept lblock={} count={} merge={}",
+            range.first_lblock,
+            count,
+            shape.requires_merge
+        );
         Ok(Some(DirectRangePlan {
             start_lblock: range.first_lblock,
             count,
@@ -131,6 +156,11 @@ impl Ext4 {
         real_data: Option<&[u8]>,
     ) -> Result<DirectRangePrepare> {
         let Some(plan) = self.direct_range_plan(inode, range)? else {
+            crate::println!(
+                "[ext4_diag] direct_reject:plan_unsupported lblock={} count={}",
+                range.first_lblock,
+                range.block_count
+            );
             return Ok(DirectRangePrepare::Unsupported);
         };
 
@@ -161,6 +191,11 @@ impl Ext4 {
             Ok(allocation) => allocation,
             Err(error) if error.code() == ErrCode::ENOSPC => {
                 transaction.abort();
+                crate::println!(
+                    "[ext4_diag] direct_reject:enospc lblock={} count={}",
+                    plan.start_lblock,
+                    plan.count
+                );
                 return Ok(DirectRangePrepare::Unsupported);
             }
             Err(error) => return Err(error),
@@ -219,10 +254,26 @@ impl Ext4 {
         self.prepare_stats.record_gdt_io();
         self.prepare_stats.record_superblock_io();
         self.prepare_stats.record_inode_io();
-        Ok(match real_data {
-            Some(_) => DirectRangePrepare::DataWritten,
-            None => DirectRangePrepare::Initialized,
-        })
+        match real_data {
+            Some(_) => {
+                crate::println!(
+                    "[ext4_diag] direct_ok:data_written lblock={} count={} pblock={}",
+                    plan.start_lblock,
+                    plan.count,
+                    allocation.first
+                );
+                Ok(DirectRangePrepare::DataWritten)
+            }
+            None => {
+                crate::println!(
+                    "[ext4_diag] direct_ok:initialized lblock={} count={} pblock={}",
+                    plan.start_lblock,
+                    plan.count,
+                    allocation.first
+                );
+                Ok(DirectRangePrepare::Initialized)
+            }
+        }
     }
 
     /// Allocate an append range through one JBD2 transaction.
@@ -711,6 +762,13 @@ impl Ext4 {
                 }
                 self.direct_range_plan(&inode, &range)?.is_some()
             };
+            if !journal_range_supported {
+                crate::println!(
+                    "[ext4_diag] fallback:no_journal_range lblock={} count={}",
+                    range.first_lblock,
+                    range.block_count
+                );
+            }
             if journal_range_supported {
                 let outcome = {
                     let _metadata_guard = self.lock_transactional_metadata_mutation()?;
@@ -738,6 +796,13 @@ impl Ext4 {
                 }
                 self.direct_range_plan(&inode, &range)?.is_some()
             };
+            if !direct_range_supported {
+                crate::println!(
+                    "[ext4_diag] fallback:no_direct_range lblock={} count={}",
+                    range.first_lblock,
+                    range.block_count
+                );
+            }
             if direct_range_supported {
                 let outcome = {
                     let _metadata_guard = self.lock_transactional_metadata_mutation()?;
