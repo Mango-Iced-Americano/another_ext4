@@ -14,7 +14,7 @@ use core::cmp::min;
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {
-        log::info!($($arg)*);
+        log::error!($($arg)*);
     };
 }
 
