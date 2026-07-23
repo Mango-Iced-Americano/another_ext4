@@ -33,6 +33,35 @@ pub struct JournalContext {
     pub head: u32,
     /// Exact 1024-byte JBD2 superblock image read at mount.
     pub superblock_image: Box<[u8; 1024]>,
+    /// Deferred checkpoint data accumulated across commits.
+    pub deferred_checkpoint: Option<DeferredCheckpoint>,
+    /// Metadata images accumulated before the next journal commit.
+    ///
+    /// The batch stores owned images instead of a `Transaction<'_>` so no
+    /// writer borrow survives the writeback call that created it.
+    pub deferred_transaction: Option<DeferredTransaction>,
+}
+
+/// Uncommitted metadata images retained for a bounded writeback batch.
+pub(crate) struct DeferredTransaction {
+    staged: BTreeMap<PBlockId, Box<[u8; BLOCK_SIZE]>>,
+}
+
+/// Checkpoint data deferred to the start of the next commit, fsync, or unmount.
+///
+/// The publish-to-cache callback already ran synchronously in `commit_journal`,
+/// so this struct only carries the I/O payload for the deferred checkpoint.
+pub(crate) struct DeferredCheckpoint {
+    /// Home blocks to checkpoint with their final images.
+    pub home_blocks: Vec<(PBlockId, Box<[u8; BLOCK_SIZE]>)>,
+    /// Clean superblock image to write after checkpoint.
+    pub clean_sb_image: Box<[u8; 1024]>,
+    /// Next journal sequence number.
+    pub next_sequence: u32,
+    /// Logical block of the commit record (for head advancement).
+    pub commit_logical: u32,
+    /// Number of commits accumulated in this deferred batch.
+    pub commit_count: u32,
 }
 
 impl JournalContext {
@@ -178,6 +207,7 @@ impl DirectTransactionCore {
             TransactionCoreRef::Direct(self),
             credits,
             preserve_originals,
+            None,
         ))
     }
 
@@ -201,7 +231,17 @@ impl JournalTransactionCore {
     }
 
     pub fn can_shutdown(&self) -> bool {
-        !self.writer.load(Ordering::Acquire) && !self.is_poisoned()
+        !self.writer.load(Ordering::Acquire)
+            && !self.is_poisoned()
+            && self.context.lock().deferred_transaction.is_none()
+    }
+
+    pub fn has_pending_checkpoint(&self) -> bool {
+        self.context.lock().deferred_checkpoint.is_some()
+    }
+
+    pub fn has_pending_transaction(&self) -> bool {
+        self.context.lock().deferred_transaction.is_some()
     }
 
     pub fn owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
@@ -234,7 +274,14 @@ impl JournalTransactionCore {
         // Reserve against a strict upper bound before any mutation is staged.
         let reservation = {
             let context = self.context.lock();
-            required_log_blocks(credits, context.superblock.features).and_then(|needed| {
+            let pending = context
+                .deferred_transaction
+                .as_ref()
+                .map_or(0, |transaction| transaction.staged.len());
+            let total = pending
+                .checked_add(credits)
+                .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))?;
+            required_log_blocks(total, context.superblock.features).and_then(|needed| {
                 ring_len(&context.superblock).map(|available| needed <= available)
             })
         };
@@ -249,11 +296,81 @@ impl JournalTransactionCore {
             self.writer.store(false, Ordering::Release);
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
+        let deferred_staged = self.context.lock().deferred_transaction.take();
         Ok(Transaction::new(
             TransactionCoreRef::Journal(self),
             credits,
             false,
+            deferred_staged,
         ))
+    }
+
+    /// Commit all metadata images accumulated by deferred writeback batches.
+    pub fn flush_deferred_transaction(
+        &self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+    ) -> core::result::Result<bool, CommitError> {
+        if self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(CommitError {
+                error: Ext4Error::new(ErrCode::EAGAIN),
+                failure: CommitFailure::BeforeCommit,
+            });
+        }
+        let deferred = self.context.lock().deferred_transaction.take();
+        let Some(deferred) = deferred else {
+            self.writer.store(false, Ordering::Release);
+            return Ok(false);
+        };
+        let transaction = Transaction::from_deferred(self, deferred);
+        transaction.commit_journal(device, publisher)?;
+        Ok(true)
+    }
+
+    /// Complete any deferred checkpoint: write home blocks, clean superblock,
+    /// flush, and update journal context.
+    ///
+    /// Returns `Ok(true)` if a deferred checkpoint existed and was flushed.
+    /// Returns `Ok(false)` if no deferred checkpoint existed.
+    pub fn force_checkpoint(&self, device: &dyn BlockDevice) -> Result<bool> {
+        let state = {
+            let mut ctx = self.context.lock();
+            ctx.deferred_checkpoint.take()
+        };
+        let state = match state {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        // Checkpoint: write home blocks to their physical locations.
+        for (home, image) in &state.home_blocks {
+            write_bytes(device, *home, image)?;
+        }
+        if !state.home_blocks.is_empty() {
+            device.flush()?;
+        }
+
+        // Write clean journal superblock.
+        let mapping = {
+            let ctx = self.context.lock();
+            ctx.logical_blocks.clone()
+        };
+        write_journal_superblock(device, &mapping, &state.clean_sb_image)?;
+        device.flush()?;
+
+        // Update journal context now that checkpoint is durable.
+        {
+            let mut context = self.context.lock();
+            context.superblock.sequence = state.next_sequence;
+            context.superblock.start = 0;
+            context.head = ring_next(&context.superblock, state.commit_logical);
+            context.superblock_image = state.clean_sb_image;
+        }
+        Ok(true)
     }
 
     fn poison(&self) {
@@ -271,28 +388,114 @@ pub struct Transaction<'a> {
     core: TransactionCoreRef<'a>,
     credits: usize,
     staged: BTreeMap<PBlockId, StagedBlock>,
+    /// Images from an earlier deferred batch. They stay separate until this
+    /// transaction commits so `abort` can restore only the prior batch.
+    deferred_staged: Option<DeferredTransaction>,
     preserve_originals: bool,
     owns_writer: bool,
 }
 
-impl Transaction<'_> {
+impl<'a> Transaction<'a> {
     fn new(
-        core: TransactionCoreRef<'_>,
+        core: TransactionCoreRef<'a>,
         credits: usize,
         preserve_originals: bool,
-    ) -> Transaction<'_> {
+        deferred_staged: Option<DeferredTransaction>,
+    ) -> Transaction<'a> {
         Transaction {
             core,
             credits,
             staged: BTreeMap::new(),
+            deferred_staged,
             preserve_originals,
             owns_writer: true,
+        }
+    }
+
+    fn from_deferred(
+        core: &'a JournalTransactionCore,
+        deferred: DeferredTransaction,
+    ) -> Transaction<'a> {
+        let staged: BTreeMap<PBlockId, StagedBlock> = deferred
+            .staged
+            .into_iter()
+            .map(|(home, image)| {
+                (
+                    home,
+                    StagedBlock {
+                        home,
+                        original: None,
+                        image,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            core: TransactionCoreRef::Journal(core),
+            credits: staged.len(),
+            staged,
+            deferred_staged: None,
+            preserve_originals: false,
+            owns_writer: true,
+        }
+    }
+
+    fn total_staged_len(&self) -> usize {
+        let deferred = self
+            .deferred_staged
+            .as_ref()
+            .map_or(0, |transaction| transaction.staged.len());
+        deferred
+            + self
+                .staged
+                .keys()
+                .filter(|home| {
+                    self.deferred_staged
+                        .as_ref()
+                        .map_or(true, |transaction| !transaction.staged.contains_key(home))
+                })
+                .count()
+    }
+
+    fn deferred_image(&self, home: PBlockId) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        self.deferred_staged
+            .as_ref()
+            .and_then(|transaction| transaction.staged.get(&home))
+            .cloned()
+    }
+
+    fn restore_deferred_staged(&mut self) {
+        let Some(deferred) = self.deferred_staged.take() else {
+            return;
+        };
+        let TransactionCoreRef::Journal(core) = self.core else {
+            return;
+        };
+        let mut context = core.context.lock();
+        debug_assert!(context.deferred_transaction.is_none());
+        context.deferred_transaction = Some(deferred);
+    }
+
+    fn absorb_deferred_staged(&mut self) {
+        let Some(deferred) = self.deferred_staged.take() else {
+            return;
+        };
+        for (home, image) in deferred.staged {
+            self.staged.entry(home).or_insert(StagedBlock {
+                home,
+                original: None,
+                image,
+            });
         }
     }
     /// Replace the final image for `home`.  Re-staging the same home block does
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
-        if !self.staged.contains_key(&home) && self.staged.len() == self.credits {
+        let was_deferred = self.deferred_image(home).is_some();
+        if !self.staged.contains_key(&home)
+            && !was_deferred
+            && self.total_staged_len() == self.credits
+        {
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
         self.staged.insert(
@@ -311,23 +514,30 @@ impl Transaction<'_> {
     /// The first access snapshots the device block and consumes one credit;
     /// later accesses return the same image, providing read-your-writes and
     /// naturally merging updates to shared metadata blocks.
-    pub fn read_for_update<'a>(
-        &'a mut self,
+    pub fn read_for_update<'tx>(
+        &'tx mut self,
         device: &dyn BlockDevice,
         home: PBlockId,
-    ) -> Result<&'a mut [u8; BLOCK_SIZE]> {
+    ) -> Result<&'tx mut [u8; BLOCK_SIZE]> {
         if !self.staged.contains_key(&home) {
-            if self.staged.len() == self.credits {
+            let deferred = self.deferred_image(home);
+            if deferred.is_none() && self.total_staged_len() == self.credits {
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
-            let block = device.read_block(home)?;
-            let original = self.preserve_originals.then(|| block.data.clone());
+            let (image, original) = match deferred {
+                Some(image) => (image, None),
+                None => {
+                    let block = device.read_block(home)?;
+                    let original = self.preserve_originals.then(|| block.data.clone());
+                    (block.data, original)
+                }
+            };
             self.staged.insert(
                 home,
                 StagedBlock {
                     home,
                     original,
-                    image: block.data,
+                    image,
                 },
             );
         }
@@ -339,16 +549,74 @@ impl Transaction<'_> {
             .as_mut())
     }
 
-    pub fn read<'a>(&'a self, device: &dyn BlockDevice, home: PBlockId) -> Result<BlockView<'a>> {
+    pub fn read<'tx>(
+        &'tx self,
+        device: &dyn BlockDevice,
+        home: PBlockId,
+    ) -> Result<BlockView<'tx>> {
         if let Some(block) = self.staged.get(&home) {
             Ok(BlockView::Staged(block.bytes()))
+        } else if let Some(block) = self
+            .deferred_staged
+            .as_ref()
+            .and_then(|transaction| transaction.staged.get(&home))
+        {
+            Ok(BlockView::Staged(block))
         } else {
             Ok(BlockView::Device(device.read_block(home)?))
         }
     }
 
     pub fn abort(mut self) {
+        self.restore_deferred_staged();
         self.release_writer();
+    }
+
+    /// Retain a journal transaction in memory until a bounded batch is ready.
+    ///
+    /// Data blocks were initialized before their allocation metadata was
+    /// staged, so a crash before this batch commits can only leak initialized
+    /// storage; it cannot publish an extent that refers to free blocks.
+    pub fn defer_or_commit(
+        mut self,
+        device: &dyn BlockDevice,
+        publisher: &dyn CachePublisher,
+        max_deferred_blocks: usize,
+    ) -> core::result::Result<(), CommitError> {
+        let TransactionCoreRef::Journal(core) = self.core else {
+            return self.commit(device, publisher);
+        };
+        let total = self.total_staged_len();
+        let must_commit = {
+            let context = core.context.lock();
+            let required =
+                required_log_blocks(total, context.superblock.features).map_err(|error| {
+                    CommitError {
+                        error,
+                        failure: CommitFailure::BeforeCommit,
+                    }
+                })?;
+            let available = ring_len(&context.superblock).map_err(|error| CommitError {
+                error,
+                failure: CommitFailure::BeforeCommit,
+            })?;
+            total >= max_deferred_blocks || required.saturating_mul(2) >= available
+        };
+        if must_commit {
+            return self.commit_journal(device, publisher);
+        }
+
+        self.absorb_deferred_staged();
+        let staged = core::mem::take(&mut self.staged)
+            .into_iter()
+            .map(|(home, staged)| (home, staged.image))
+            .collect();
+        let mut context = core.context.lock();
+        debug_assert!(context.deferred_transaction.is_none());
+        context.deferred_transaction = Some(DeferredTransaction { staged });
+        drop(context);
+        self.release_writer();
+        Ok(())
     }
 
     pub fn commit(
@@ -502,6 +770,7 @@ impl Transaction<'_> {
         device: &dyn BlockDevice,
         publisher: &dyn CachePublisher,
     ) -> core::result::Result<(), CommitError> {
+        self.absorb_deferred_staged();
         let TransactionCoreRef::Journal(core) = self.core else {
             unreachable!()
         };
@@ -586,20 +855,71 @@ impl Transaction<'_> {
             }
         })?;
 
-        // Publish an active tail before log payload.  Recovery may safely scan
-        // an empty/uncommitted transaction after a crash at this point.
-        if let Err(error) = write_journal_superblock(device, &mapping, &active_sb_image)
-            .and_then(|_| device.flush())
+        // Drain deferred checkpoint when accumulated commits would risk
+        // overwriting uncheckpointed journal log records.  Without advancing
+        // head, repeated deferred commits reuse the same ring position.
+        const MAX_DEFERRED_COMMITS: u32 = 4;
+        let mut must_drain = false;
         {
-            return self.fail(error, CommitFailure::BeforeCommit, true);
+            let ctx = core.context.lock();
+            if let Some(ref dc) = ctx.deferred_checkpoint {
+                must_drain = dc.commit_count + 1 > MAX_DEFERRED_COMMITS;
+            }
+        }
+        if must_drain {
+            if let Err(error) = complete_deferred_checkpoint(core, device) {
+                core.poison();
+                return self.fail(error, CommitFailure::CheckpointFailed, true);
+            }
         }
 
-        debug_assert_eq!(encoded.len() + 1, positions.len());
-        for (logical, bytes) in positions[..encoded.len()].iter().zip(encoded.iter()) {
-            if let Err(error) = write_bytes(device, mapping[*logical as usize], bytes) {
+        // Write active superblock only for the first commit in a deferred
+        // batch.  Skipping it on later commits preserves the journal start
+        // point so that crash recovery can replay earlier uncheckpointed
+        // transactions in the same ring range.
+        let has_existing = core.context.lock().deferred_checkpoint.is_some();
+        if !has_existing {
+            if let Err(error) = write_journal_superblock(device, &mapping, &active_sb_image) {
                 return self.fail(error, CommitFailure::BeforeCommit, true);
             }
         }
+
+        debug_assert_eq!(encoded.len() + 1, positions.len());
+        // P11: Group contiguous journal physical blocks and issue one
+        // write_blocks() per run to amortize I/O submission overhead.
+        let mut run_start = 0usize;
+        while run_start < encoded.len() {
+            let first_phys = mapping[positions[run_start] as usize];
+            let mut run_end = run_start + 1;
+            while run_end < encoded.len() {
+                let expected = first_phys.wrapping_add((run_end - run_start) as u64);
+                if mapping[positions[run_end] as usize] != expected {
+                    break;
+                }
+                run_end += 1;
+            }
+            let run_len = run_end - run_start;
+            if run_len > 1 {
+                let total_bytes = run_len * BLOCK_SIZE;
+                let mut buf = Vec::with_capacity(total_bytes);
+                buf.resize(total_bytes, 0u8);
+                for (i, src_box) in encoded[run_start..run_end].iter().enumerate() {
+                    let dest = &mut buf[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+                    let src: &[u8] = src_box.as_ref();
+                    dest.copy_from_slice(src);
+                }
+                if let Err(error) = device.write_blocks(first_phys, &buf) {
+                    return self.fail(error, CommitFailure::BeforeCommit, true);
+                }
+            } else {
+                let block: &[u8; BLOCK_SIZE] = encoded[run_start].as_ref();
+                if let Err(error) = write_bytes(device, first_phys, block) {
+                    return self.fail(error, CommitFailure::BeforeCommit, true);
+                }
+            }
+            run_start = run_end;
+        }
+        // Single barrier for active-SB + payload (was two separate flushes)
         if let Err(error) = device.flush() {
             return self.fail(error, CommitFailure::BeforeCommit, true);
         }
@@ -612,28 +932,55 @@ impl Transaction<'_> {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
 
-        for staged in self.staged.values() {
-            if let Err(error) = write_bytes(device, staged.home, staged.bytes()) {
-                return self.fail(error, CommitFailure::CheckpointFailed, true);
-            }
+        // Advance journal head and sequence immediately — the commit record
+        // is durable and must not be overwritten by the next commit even when
+        // the home-block checkpoint is deferred.
+        {
+            let mut ctx = core.context.lock();
+            ctx.superblock.sequence = next_sequence;
+            ctx.head = ring_next(&ctx.superblock, commit_logical);
         }
-        if let Err(error) = device.flush() {
-            return self.fail(error, CommitFailure::CheckpointFailed, true);
-        }
+
+        // Publish to in-memory cache immediately — the journal log is already
+        // durable so recovery can replay if a crash interrupts the deferred
+        // checkpoint.
         publisher.publish(&self.staged);
 
-        if let Err(error) =
-            write_journal_superblock(device, &mapping, &clean_sb_image).and_then(|_| device.flush())
+        // === Store deferred checkpoint ===
+        let home_blocks: Vec<(PBlockId, Box<[u8; BLOCK_SIZE]>)> = self
+            .staged
+            .iter()
+            .map(|(home, s)| (*home, s.image.clone()))
+            .collect();
+
         {
-            return self.fail(error, CommitFailure::TailUpdateFailed, true);
+            let mut ctx = core.context.lock();
+            // P10: Accumulate across commits — merge new blocks, overwriting
+            // any pending entries for the same home block.
+            let deferred = DeferredCheckpoint {
+                home_blocks,
+                clean_sb_image,
+                next_sequence,
+                commit_logical,
+                commit_count: 1,
+            };
+            if let Some(existing) = &mut ctx.deferred_checkpoint {
+                for (home, image) in &deferred.home_blocks {
+                    if let Some(pos) = existing.home_blocks.iter().position(|(h, _)| h == home) {
+                        existing.home_blocks[pos].1 = image.clone();
+                    } else {
+                        existing.home_blocks.push((*home, image.clone()));
+                    }
+                }
+                existing.clean_sb_image = deferred.clean_sb_image;
+                existing.next_sequence = deferred.next_sequence;
+                existing.commit_logical = deferred.commit_logical;
+                existing.commit_count += 1;
+            } else {
+                ctx.deferred_checkpoint = Some(deferred);
+            }
         }
-        {
-            let mut context = core.context.lock();
-            context.superblock.sequence = next_sequence;
-            context.superblock.start = 0;
-            context.head = ring_next(&sb, commit_logical);
-            context.superblock_image = clean_sb_image;
-        }
+
         self.release_writer();
         Ok(())
     }
@@ -650,6 +997,7 @@ impl Transaction<'_> {
                 TransactionCoreRef::Direct(core) => core.poison(),
             }
         }
+        self.restore_deferred_staged();
         self.release_writer();
         Err(CommitError { error, failure })
     }
@@ -667,6 +1015,7 @@ impl Transaction<'_> {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
+        self.restore_deferred_staged();
         self.release_writer();
     }
 }
@@ -855,6 +1204,41 @@ fn write_journal_superblock(
 
 fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE]) -> Result<()> {
     device.write_block(&Block::new(id, Box::new(*bytes)))
+}
+
+/// Complete a pending deferred checkpoint: write home blocks, clean superblock,
+/// flush, and update journal context.  Used at the start of `commit_journal`.
+fn complete_deferred_checkpoint(
+    core: &JournalTransactionCore,
+    device: &dyn BlockDevice,
+) -> Result<()> {
+    let state = {
+        let mut ctx = core.context.lock();
+        ctx.deferred_checkpoint.take()
+    };
+    let Some(state) = state else {
+        return Ok(());
+    };
+
+    for (home, image) in &state.home_blocks {
+        write_bytes(device, *home, image)?;
+    }
+    if !state.home_blocks.is_empty() {
+        device.flush()?;
+    }
+
+    let mapping = { core.context.lock().logical_blocks.clone() };
+    write_journal_superblock(device, &mapping, &state.clean_sb_image)?;
+    device.flush()?;
+
+    {
+        let mut context = core.context.lock();
+        context.superblock.sequence = state.next_sequence;
+        context.superblock.start = 0;
+        context.head = ring_next(&context.superblock, state.commit_logical);
+        context.superblock_image = state.clean_sb_image;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1299,6 +1683,8 @@ mod tests {
             target_blocks: 1000,
             head,
             superblock_image: image,
+            deferred_checkpoint: None,
+            deferred_transaction: None,
         }
     }
 
@@ -1317,21 +1703,60 @@ mod tests {
 
         transaction.commit(&device, &publisher).unwrap();
 
+        // Commit only does sync phase (active SB + payload + commit). The
+        // deferred checkpoint (home block writes, clean SB) happens later in
+        // force_checkpoint.
         assert_eq!(device.reads.load(Ordering::SeqCst), expected_reads);
         assert_eq!(device.writes.load(Ordering::SeqCst), expected_writes);
-        assert_eq!(device.flushes.load(Ordering::SeqCst), 5);
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 2);
         assert_eq!(publisher.0.load(Ordering::SeqCst), homes);
         assert!(!core.is_poisoned());
     }
 
     #[test]
     fn journal_commit_four_homes_has_expected_fixed_io_shape() {
-        assert_counted_commit_shape(4, 6, 12);
+        // 5 reads: 1 active-SB + 4 read_for_update
+        // 7 writes: 1 active-SB + 1 descriptor + 4 data (batched) + 1 commit
+        assert_counted_commit_shape(4, 5, 7);
     }
 
     #[test]
     fn journal_commit_max_fast_metadata_images_has_expected_fixed_io_shape() {
-        assert_counted_commit_shape(TEST_MAX_FAST_METADATA_IMAGES, 18, 36);
+        // 17 reads: 1 active-SB + 16 read_for_update
+        // 19 writes: 1 active-SB + 1 descriptor + 16 data (batched) + 1 commit
+        assert_counted_commit_shape(TEST_MAX_FAST_METADATA_IMAGES, 17, 19);
+    }
+
+    #[test]
+    fn deferred_writeback_batches_share_one_journal_commit() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context_with_ring(
+            TEST_LARGE_JOURNAL_BLOCKS,
+            TEST_LARGE_JOURNAL_BLOCKS - 1,
+        ))
+        .unwrap();
+
+        let mut first = core.start(1).unwrap();
+        first.stage(42, Box::new([1; BLOCK_SIZE])).unwrap();
+        first
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+        let mut second = core.start(1).unwrap();
+        second.stage(43, Box::new([2; BLOCK_SIZE])).unwrap();
+        second
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        assert!(core.has_pending_transaction());
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+
+        assert!(core
+            .flush_deferred_transaction(&device, &publisher)
+            .unwrap());
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 2);
+        assert!(!core.has_pending_transaction());
     }
 
     #[test]

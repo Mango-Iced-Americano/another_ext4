@@ -5,6 +5,7 @@ use crate::return_error;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod alloc;
+mod data_write;
 mod dir;
 mod extent;
 mod high_level;
@@ -14,6 +15,7 @@ mod journal_transaction;
 mod link;
 mod low_level;
 mod orphan;
+mod prepared_extent;
 mod rw;
 mod xattr_reclaim;
 
@@ -105,6 +107,8 @@ pub struct Ext4 {
     /// sharding so unrelated apt download files do not serialize on one global
     /// filesystem-wide spin lock.
     inode_mutation_locks: Vec<spin::Mutex<()>>,
+    /// Advisory positive mappings, versioned by metadata-mutation epoch.
+    prepared_extents: spin::Mutex<prepared_extent::PreparedExtentCache>,
     prepare_stats: PrepareStats,
 }
 
@@ -124,6 +128,27 @@ pub struct PrepareStatsSnapshot {
     pub inode_io: usize,
     pub extent_io: usize,
     pub zero_io: usize,
+    pub block_count_full_traversals: usize,
+    pub inode_read_calls: usize,
+    pub inode_read_cycles: usize,
+    pub extent_query_calls: usize,
+    /// Every extent-tree lookup attempt, including non-diagnostic devices.
+    pub extent_query_attempts: usize,
+    pub extent_query_cycles: usize,
+    pub allocation_calls: usize,
+    pub allocation_cycles: usize,
+    pub inode_persist_calls: usize,
+    pub inode_persist_cycles: usize,
+    pub lock_wait_calls: usize,
+    pub lock_wait_cycles: usize,
+    pub lock_hold_calls: usize,
+    pub lock_hold_cycles: usize,
+}
+
+pub(super) struct WriteLogicalRange {
+    pub(super) first_lblock: LBlockId,
+    pub(super) last_lblock: LBlockId,
+    pub(super) block_count: usize,
 }
 
 struct PrepareStats {
@@ -140,6 +165,20 @@ struct PrepareStats {
     inode_io: AtomicUsize,
     extent_io: AtomicUsize,
     zero_io: AtomicUsize,
+    block_count_full_traversals: AtomicUsize,
+    inode_read_calls: AtomicUsize,
+    inode_read_cycles: AtomicUsize,
+    extent_query_calls: AtomicUsize,
+    extent_query_attempts: AtomicUsize,
+    extent_query_cycles: AtomicUsize,
+    allocation_calls: AtomicUsize,
+    allocation_cycles: AtomicUsize,
+    inode_persist_calls: AtomicUsize,
+    inode_persist_cycles: AtomicUsize,
+    lock_wait_calls: AtomicUsize,
+    lock_wait_cycles: AtomicUsize,
+    lock_hold_calls: AtomicUsize,
+    lock_hold_cycles: AtomicUsize,
 }
 
 impl PrepareStats {
@@ -158,6 +197,20 @@ impl PrepareStats {
             inode_io: AtomicUsize::new(0),
             extent_io: AtomicUsize::new(0),
             zero_io: AtomicUsize::new(0),
+            block_count_full_traversals: AtomicUsize::new(0),
+            inode_read_calls: AtomicUsize::new(0),
+            inode_read_cycles: AtomicUsize::new(0),
+            extent_query_calls: AtomicUsize::new(0),
+            extent_query_attempts: AtomicUsize::new(0),
+            extent_query_cycles: AtomicUsize::new(0),
+            allocation_calls: AtomicUsize::new(0),
+            allocation_cycles: AtomicUsize::new(0),
+            inode_persist_calls: AtomicUsize::new(0),
+            inode_persist_cycles: AtomicUsize::new(0),
+            lock_wait_calls: AtomicUsize::new(0),
+            lock_wait_cycles: AtomicUsize::new(0),
+            lock_hold_calls: AtomicUsize::new(0),
+            lock_hold_cycles: AtomicUsize::new(0),
         }
     }
 
@@ -239,6 +292,44 @@ impl PrepareStats {
         }
     }
 
+    fn record_block_count_full_traversal(&self) {
+        if P6_2_STATS_ENABLED {
+            self.block_count_full_traversals
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn phase_start(&self, device: &dyn BlockDevice) -> Option<usize> {
+        if P6_2_STATS_ENABLED && device.diagnostic_enabled() {
+            Some(device.diagnostic_cycles())
+        } else {
+            None
+        }
+    }
+
+    fn record_phase(&self, phase: PreparePhase, start: Option<usize>, device: &dyn BlockDevice) {
+        let Some(start) = start else {
+            return;
+        };
+        let elapsed = device.diagnostic_cycles().wrapping_sub(start);
+        let (calls, cycles) = match phase {
+            PreparePhase::InodeRead => (&self.inode_read_calls, &self.inode_read_cycles),
+            PreparePhase::ExtentQuery => (&self.extent_query_calls, &self.extent_query_cycles),
+            PreparePhase::Allocation => (&self.allocation_calls, &self.allocation_cycles),
+            PreparePhase::InodePersist => (&self.inode_persist_calls, &self.inode_persist_cycles),
+            PreparePhase::LockWait => (&self.lock_wait_calls, &self.lock_wait_cycles),
+            PreparePhase::LockHold => (&self.lock_hold_calls, &self.lock_hold_cycles),
+        };
+        calls.fetch_add(1, Ordering::Relaxed);
+        cycles.fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_extent_query_attempt(&self) {
+        if P6_2_STATS_ENABLED {
+            self.extent_query_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn snapshot(&self) -> PrepareStatsSnapshot {
         PrepareStatsSnapshot {
             enabled: P6_2_STATS_ENABLED,
@@ -255,7 +346,46 @@ impl PrepareStats {
             inode_io: self.inode_io.load(Ordering::Relaxed),
             extent_io: self.extent_io.load(Ordering::Relaxed),
             zero_io: self.zero_io.load(Ordering::Relaxed),
+            block_count_full_traversals: self.block_count_full_traversals.load(Ordering::Relaxed),
+            inode_read_calls: self.inode_read_calls.load(Ordering::Relaxed),
+            inode_read_cycles: self.inode_read_cycles.load(Ordering::Relaxed),
+            extent_query_calls: self.extent_query_calls.load(Ordering::Relaxed),
+            extent_query_attempts: self.extent_query_attempts.load(Ordering::Relaxed),
+            extent_query_cycles: self.extent_query_cycles.load(Ordering::Relaxed),
+            allocation_calls: self.allocation_calls.load(Ordering::Relaxed),
+            allocation_cycles: self.allocation_cycles.load(Ordering::Relaxed),
+            inode_persist_calls: self.inode_persist_calls.load(Ordering::Relaxed),
+            inode_persist_cycles: self.inode_persist_cycles.load(Ordering::Relaxed),
+            lock_wait_calls: self.lock_wait_calls.load(Ordering::Relaxed),
+            lock_wait_cycles: self.lock_wait_cycles.load(Ordering::Relaxed),
+            lock_hold_calls: self.lock_hold_calls.load(Ordering::Relaxed),
+            lock_hold_cycles: self.lock_hold_cycles.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreparePhase {
+    InodeRead,
+    ExtentQuery,
+    Allocation,
+    InodePersist,
+    LockWait,
+    LockHold,
+}
+
+struct PrepareMutationLockGuard<'a> {
+    guard: spin::MutexGuard<'a, ()>,
+    stats: &'a PrepareStats,
+    device: &'a dyn BlockDevice,
+    hold_start: Option<usize>,
+}
+
+impl Drop for PrepareMutationLockGuard<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .record_phase(PreparePhase::LockHold, self.hold_start, self.device);
+        let _ = &self.guard;
     }
 }
 
@@ -357,6 +487,32 @@ const INODE_CACHE_SIZE: usize = 512;
 pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
+    pub(super) fn checked_write_logical_range(
+        offset: usize,
+        len: usize,
+    ) -> Result<Option<WriteLogicalRange>> {
+        if len == 0 {
+            return Ok(None);
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let first_lblock =
+            LBlockId::try_from(offset / BLOCK_SIZE).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let last_lblock = LBlockId::try_from((end - 1) / BLOCK_SIZE)
+            .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let block_count = last_lblock
+            .checked_sub(first_lblock)
+            .and_then(|blocks| blocks.checked_add(1))
+            .and_then(|blocks| usize::try_from(blocks).ok())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        Ok(Some(WriteLogicalRange {
+            first_lblock,
+            last_lblock,
+            block_count,
+        }))
+    }
+
     pub fn prepare_stats_snapshot(&self) -> PrepareStatsSnapshot {
         self.prepare_stats.snapshot()
     }
@@ -367,6 +523,33 @@ impl Ext4 {
 
     pub fn record_prepare_elapsed_cycles(&self, cycles: usize) {
         self.prepare_stats.record_elapsed_cycles(cycles);
+    }
+
+    fn lock_inode_mutation_for_prepare(&self, id: InodeId) -> PrepareMutationLockGuard<'_> {
+        let lock = &self.inode_mutation_locks[self.inode_mutation_lock_index(id)];
+        let wait_start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let guard = match wait_start {
+            Some(_) => match lock.try_lock() {
+                Some(guard) => guard,
+                None => {
+                    let guard = lock.lock();
+                    self.prepare_stats.record_phase(
+                        PreparePhase::LockWait,
+                        wait_start,
+                        self.block_device.as_ref(),
+                    );
+                    guard
+                }
+            },
+            None => lock.lock(),
+        };
+        let hold_start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        PrepareMutationLockGuard {
+            guard,
+            stats: &self.prepare_stats,
+            device: self.block_device.as_ref(),
+            hold_start,
+        }
     }
 
     fn is_power_of(mut value: u32, base: u32) -> bool {
@@ -618,6 +801,7 @@ impl Ext4 {
             write_barrier: true,
             direct_restore_clean: false,
             inode_mutation_locks,
+            prepared_extents: spin::Mutex::new(prepared_extent::PreparedExtentCache::new()),
             prepare_stats: PrepareStats::new(),
         })
     }
@@ -770,6 +954,10 @@ impl Ext4 {
     /// Enter a complete legacy/direct metadata mutation operation.
     #[inline]
     pub(super) fn lock_direct_metadata_mutation(&self) -> Result<MetadataMutationGuard<'_>> {
+        // Legacy/direct paths cannot observe metadata that exists only in a
+        // deferred journal batch. Commit that batch before sharing the direct
+        // mutation domain.
+        self.flush_deferred_journal()?;
         self.metadata_mutation_barrier.try_direct()
     }
 

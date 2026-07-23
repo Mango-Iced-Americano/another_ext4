@@ -118,7 +118,34 @@ impl Ext4 {
     }
 
     pub fn flush_device(&self) -> Result<()> {
+        if let MetadataMutationMode::Journal(core) = &self.metadata_mode {
+            self.flush_deferred_journal()?;
+            match core.force_checkpoint(self.block_device.as_ref()) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    self.poison(ErrCode::EIO);
+                    return Err(error);
+                }
+            }
+        }
         self.block_device.flush()
+    }
+
+    /// Commit pending writeback metadata before a durability boundary.
+    pub fn flush_deferred_journal(&self) -> Result<()> {
+        let MetadataMutationMode::Journal(core) = &self.metadata_mode else {
+            return Ok(());
+        };
+        match core.flush_deferred_transaction(self.block_device.as_ref(), self) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if error.failure != journal_transaction::CommitFailure::BeforeCommit {
+                    self.poison(ErrCode::EIO);
+                }
+                Err(error.error)
+            }
+        }
     }
 
     pub(super) fn initialize_direct(&mut self) -> Result<()> {
@@ -180,12 +207,20 @@ impl Ext4 {
             }
             MetadataMutationMode::Journal(core) => core,
         };
+        if journal.is_poisoned() {
+            return Err(Ext4Error::new(ErrCode::EIO));
+        }
+        self.flush_deferred_journal()?;
+        if let Err(error) = journal.force_checkpoint(self.block_device.as_ref()) {
+            self.poison(ErrCode::EIO);
+            return Err(error);
+        }
         if !journal.can_shutdown() {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
-        // Every synchronous transaction checkpoints and clears s_start before
-        // returning. With new writers excluded by VFS umount, it is now safe
-        // to clear RECOVER as Linux does at clean shutdown.
+        // Deferred checkpoints are complete and new writers are excluded by
+        // VFS umount, so it is now safe to clear RECOVER as Linux does at a
+        // clean shutdown.
         let mut sb = self.read_super_block_cached();
         sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, false);
         self.write_super_block(&sb)?;
@@ -327,6 +362,8 @@ impl Ext4 {
                     target_blocks: ext4_sb.block_count(),
                     head,
                     superblock_image: image,
+                    deferred_checkpoint: None,
+                    deferred_transaction: None,
                 },
             )?);
 
@@ -392,6 +429,11 @@ impl journal_transaction::CachePublisher for Ext4 {
                 .map(|(block, _)| !blocks.contains_key(&block))
                 .unwrap_or(false)
         });
+        // Every successful transaction can make a previously prepared extent
+        // stale (direct-range allocation, truncate/reclaim, or recovery).
+        // Invalidate at the common post-commit publication point rather than
+        // requiring individual transaction writers to remember this step.
+        self.invalidate_prepared_extents();
     }
 }
 

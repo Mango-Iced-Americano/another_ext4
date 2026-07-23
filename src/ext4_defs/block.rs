@@ -118,6 +118,16 @@ pub trait BlockDevice: Send + Sync + Any {
     fn flush(&self) -> Result<()>;
     /// Whether [`Self::flush`] provides a power-loss durability barrier.
     fn supports_reliable_flush(&self) -> bool;
+
+    /// Whether the embedding kernel has enabled bounded diagnostic sampling.
+    fn diagnostic_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns the embedding kernel's monotonic cycle counter when diagnostics are enabled.
+    fn diagnostic_cycles(&self) -> usize {
+        0
+    }
 }
 
 #[cfg(test)]

@@ -167,7 +167,11 @@ impl Ext4 {
     /// Read and authenticate a non-root extent node before interpreting any
     /// header or entry.  Linux performs the equivalent check in
     /// `ext4_extent_block_csum_verify()`.
-    fn read_extent_block(&self, inode_ref: &InodeRef, pblock: PBlockId) -> Result<Block> {
+    pub(super) fn read_extent_block(
+        &self,
+        inode_ref: &InodeRef,
+        pblock: PBlockId,
+    ) -> Result<Block> {
         self.ensure_valid_pblock(inode_ref.id, pblock, "extent tree node")?;
         self.validate_data_blocks(pblock, 1)?;
         let block = self.read_block(pblock)?;
@@ -448,13 +452,13 @@ impl Ext4 {
 }
 
 #[derive(Debug)]
-struct ExtentSearchStep {
+pub(super) struct ExtentSearchStep {
     /// The physical block where this extent node is stored.
     /// For a root node, this field is 0.
-    pblock: PBlockId,
+    pub(super) pblock: PBlockId,
     /// Index of the found `ExtentIndex` or `Extent` if found, the position where the
     /// `ExtentIndex` or `Extent` should be inserted if not found.
-    index: core::result::Result<usize, usize>,
+    pub(super) index: core::result::Result<usize, usize>,
 }
 
 impl ExtentSearchStep {
@@ -467,39 +471,49 @@ impl ExtentSearchStep {
 impl Ext4 {
     /// Given a logic block id, find the corresponding fs block id.
     pub(super) fn extent_query(&self, inode_ref: &InodeRef, iblock: LBlockId) -> Result<PBlockId> {
-        let path = self.find_extent(inode_ref, iblock)?;
-        // Leaf is the last element of the path
-        let leaf = path.last().ok_or(format_error!(
-            ErrCode::EIO,
-            "extent_query: empty extent search path on inode {}",
-            inode_ref.id
-        ))?;
-        if let Ok(index) = leaf.index {
-            // Note: block data must be defined here to keep it alive
-            let block_data: Block;
-            let ex_node = if leaf.pblock != 0 {
-                // Load the extent node
-                self.ensure_valid_pblock(inode_ref.id, leaf.pblock, "extent leaf node")?;
-                block_data = self.read_extent_block(inode_ref, leaf.pblock)?;
-                // Load the next extent header
-                ExtentNode::from_bytes(&*block_data.data)
+        self.prepare_stats.record_extent_query_attempt();
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            let path = self.find_extent(inode_ref, iblock)?;
+            // Leaf is the last element of the path
+            let leaf = path.last().ok_or(format_error!(
+                ErrCode::EIO,
+                "extent_query: empty extent search path on inode {}",
+                inode_ref.id
+            ))?;
+            if let Ok(index) = leaf.index {
+                // Note: block data must be defined here to keep it alive
+                let block_data: Block;
+                let ex_node = if leaf.pblock != 0 {
+                    // Load the extent node
+                    self.ensure_valid_pblock(inode_ref.id, leaf.pblock, "extent leaf node")?;
+                    block_data = self.read_extent_block(inode_ref, leaf.pblock)?;
+                    // Load the next extent header
+                    ExtentNode::from_bytes(&*block_data.data)
+                } else {
+                    // Root node
+                    inode_ref.inode.extent_root()
+                };
+                let ex = ex_node.extent_at(index);
+                let pblock = ex.start_pblock() + (iblock - ex.start_lblock()) as PBlockId;
+                self.ensure_valid_pblock(inode_ref.id, pblock, "extent data block")?;
+                self.validate_data_blocks(pblock, 1)?;
+                Ok(pblock)
             } else {
-                // Root node
-                inode_ref.inode.extent_root()
-            };
-            let ex = ex_node.extent_at(index);
-            let pblock = ex.start_pblock() + (iblock - ex.start_lblock()) as PBlockId;
-            self.ensure_valid_pblock(inode_ref.id, pblock, "extent data block")?;
-            self.validate_data_blocks(pblock, 1)?;
-            Ok(pblock)
-        } else {
-            Err(format_error!(
-                ErrCode::ENOENT,
-                "extent_query: inode {} query iblock {} not found",
-                inode_ref.id,
-                iblock
-            ))
-        }
+                Err(format_error!(
+                    ErrCode::ENOENT,
+                    "extent_query: inode {} query iblock {} not found",
+                    inode_ref.id,
+                    iblock
+                ))
+            }
+        })();
+        self.prepare_stats.record_phase(
+            super::PreparePhase::ExtentQuery,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
     }
 
     /// Given a logic block id, find the corresponding fs block id.
@@ -510,7 +524,7 @@ impl Ext4 {
         iblock: LBlockId,
         block_count: u32,
     ) -> Result<PBlockId> {
-        self.extent_query_or_create_initialized(inode_ref, iblock, block_count, None)
+        self.extent_query_or_create_with_data_block(inode_ref, iblock, block_count, None, None)
     }
 
     pub(super) fn extent_query_or_create_initialized(
@@ -519,6 +533,41 @@ impl Ext4 {
         iblock: LBlockId,
         block_count: u32,
         initial_image: Option<Box<[u8; BLOCK_SIZE]>>,
+    ) -> Result<PBlockId> {
+        self.extent_query_or_create_with_data_block(
+            inode_ref,
+            iblock,
+            block_count,
+            initial_image,
+            None,
+        )
+    }
+
+    /// Publish a contiguous, already initialized data range in the extent tree.
+    /// Allocation metadata must be durable before this helper is called.
+    pub(super) fn extent_query_or_create_preallocated(
+        &self,
+        inode_ref: &mut InodeRef,
+        iblock: LBlockId,
+        block_count: u32,
+        first_pblock: PBlockId,
+    ) -> Result<PBlockId> {
+        self.extent_query_or_create_with_data_block(
+            inode_ref,
+            iblock,
+            block_count,
+            None,
+            Some(first_pblock),
+        )
+    }
+
+    fn extent_query_or_create_with_data_block(
+        &self,
+        inode_ref: &mut InodeRef,
+        iblock: LBlockId,
+        block_count: u32,
+        initial_image: Option<Box<[u8; BLOCK_SIZE]>>,
+        preallocated_first: Option<PBlockId>,
     ) -> Result<PBlockId> {
         let path = self.find_extent(inode_ref, iblock)?;
         // Leaf is the last element of the path
@@ -562,7 +611,10 @@ impl Ext4 {
                 // becomes reachable from either the inode root or an external
                 // extent node.  Metadata-node allocations below continue to
                 // use alloc_block directly.
-                let fblock = if let Some(image) = initial_image {
+                let fblock = if let Some(first) = preallocated_first {
+                    self.validate_data_blocks(first, block_count as u64)?;
+                    first
+                } else if let Some(image) = initial_image {
                     self.alloc_initialized_data_block(inode_ref, image)?
                 } else {
                     self.alloc_zeroed_data_block(inode_ref)?
@@ -735,7 +787,11 @@ impl Ext4 {
     }
 
     /// Find the given logic block id in the extent tree, return the search path
-    fn find_extent(&self, inode_ref: &InodeRef, iblock: LBlockId) -> Result<Vec<ExtentSearchStep>> {
+    pub(super) fn find_extent(
+        &self,
+        inode_ref: &InodeRef,
+        iblock: LBlockId,
+    ) -> Result<Vec<ExtentSearchStep>> {
         let mut path: Vec<ExtentSearchStep> = Vec::new();
         let mut ex_node = inode_ref.inode.extent_root();
         let mut pblock = 0;
@@ -1031,7 +1087,12 @@ impl Ext4 {
         Ok(())
     }
 
-    fn ensure_valid_pblock(&self, inode_id: InodeId, pblock: PBlockId, what: &str) -> Result<()> {
+    pub(super) fn ensure_valid_pblock(
+        &self,
+        inode_id: InodeId,
+        pblock: PBlockId,
+        what: &str,
+    ) -> Result<()> {
         let sb = self.read_super_block_cached();
         let block_count = sb.block_count();
         if pblock >= block_count {

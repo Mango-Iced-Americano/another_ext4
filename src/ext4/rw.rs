@@ -136,29 +136,47 @@ impl Ext4 {
     /// Read an inode from cache or block device, return an `InodeRef` that
     /// combines the inode and its id.
     pub(super) fn read_inode(&self, inode_id: InodeId) -> Result<InodeRef> {
-        // Try cache first
-        if let Some(cached) = self.inode_cache.lock().get(inode_id) {
-            return Ok(cached);
-        }
-        // Cache miss: read from disk
-        let (block_id, offset) = self.inode_disk_pos(inode_id)?;
-        let block = self.read_block(block_id)?;
-        self.prepare_stats.record_inode_io();
-        let inode_ref = InodeRef::new(inode_id, Box::new(block.read_offset_as(offset)));
-        // Populate cache
-        self.inode_cache.lock().insert(inode_ref.clone());
-        Ok(inode_ref)
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            // Try cache first
+            if let Some(cached) = self.inode_cache.lock().get(inode_id) {
+                return Ok(cached);
+            }
+            // Cache miss: read from disk
+            let (block_id, offset) = self.inode_disk_pos(inode_id)?;
+            let block = self.read_block(block_id)?;
+            self.prepare_stats.record_inode_io();
+            let inode_ref = InodeRef::new(inode_id, Box::new(block.read_offset_as(offset)));
+            // Populate cache
+            self.inode_cache.lock().insert(inode_ref.clone());
+            Ok(inode_ref)
+        })();
+        self.prepare_stats.record_phase(
+            super::PreparePhase::InodeRead,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
     }
 
     /// Read the authoritative inode-table entry without consulting the value cache.
     pub(super) fn read_inode_uncached(&self, inode_id: InodeId) -> Result<InodeRef> {
-        let (block_id, offset) = self.inode_disk_pos(inode_id)?;
-        let block = self.read_block(block_id)?;
-        self.prepare_stats.record_inode_io();
-        Ok(InodeRef::new(
-            inode_id,
-            Box::new(block.read_offset_as(offset)),
-        ))
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            let (block_id, offset) = self.inode_disk_pos(inode_id)?;
+            let block = self.read_block(block_id)?;
+            self.prepare_stats.record_inode_io();
+            Ok(InodeRef::new(
+                inode_id,
+                Box::new(block.read_offset_as(offset)),
+            ))
+        })();
+        self.prepare_stats.record_phase(
+            super::PreparePhase::InodeRead,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
     }
 
     /// Read the root inode from block device
@@ -176,15 +194,27 @@ impl Ext4 {
 
     /// Write an inode to block device without checksum, and update cache.
     pub(super) fn write_inode_without_csum(&self, inode_ref: &InodeRef) -> Result<()> {
-        let (block_id, offset) = self.inode_disk_pos(inode_ref.id)?;
-        let mut block = self.read_block(block_id)?;
-        self.prepare_stats.record_inode_io();
-        block.write_offset_as(offset, &*inode_ref.inode);
-        self.write_block(&block)?;
-        self.prepare_stats.record_inode_io();
-        // Update cache with the latest inode data
-        self.inode_cache.lock().update(inode_ref);
-        Ok(())
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            let (block_id, offset) = self.inode_disk_pos(inode_ref.id)?;
+            let mut block = self.read_block(block_id)?;
+            self.prepare_stats.record_inode_io();
+            block.write_offset_as(offset, &*inode_ref.inode);
+            self.write_block(&block)?;
+            self.prepare_stats.record_inode_io();
+            // Update cache with the latest inode data
+            self.inode_cache.lock().update(inode_ref);
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.invalidate_prepared_extents();
+        }
+        self.prepare_stats.record_phase(
+            super::PreparePhase::InodePersist,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
     }
 
     /// Read a block group descriptor from cache, return a `BlockGroupRef`

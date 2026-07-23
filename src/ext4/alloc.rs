@@ -1,4 +1,4 @@
-use super::Ext4;
+use super::{Ext4, InodeOwner};
 use crate::constants::*;
 use crate::ext4_defs::*;
 use crate::format_error;
@@ -9,6 +9,17 @@ use core::cmp::min;
 pub(super) struct DirectRangeAllocation {
     pub first: PBlockId,
     pub allocation_homes: [PBlockId; 3],
+}
+
+struct DeferredDataGroup {
+    bitmap: Block,
+    old_bitmap: Block,
+    block_group: BlockGroupRef,
+}
+
+struct DeferredGdtBlock {
+    image: Block,
+    old_image: Block,
 }
 
 const DIRECT_RANGE_MAX_GROUP_PROBES: u32 = 4;
@@ -45,6 +56,209 @@ fn linked_orphan_tail_remove_limit(
 }
 
 impl Ext4 {
+    /// Allocate and zero data blocks before publishing their allocation
+    /// metadata.  Every touched bitmap and group descriptor is written once,
+    /// and the superblock is updated once after all data initialization.
+    ///
+    /// The caller must publish the matching extents only after this returns.
+    /// Thus a crash can leave initialized, unreachable blocks allocated, but
+    /// can never expose an extent whose data or allocation bitmap is stale.
+    pub(super) fn alloc_zeroed_data_blocks(
+        &self,
+        inode: &InodeRef,
+        count: usize,
+    ) -> Result<Vec<PBlockId>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            let _alloc_guard = self.alloc_lock.lock();
+            let mut sb = self.read_super_block_cached();
+            let old_sb = sb;
+            let count_u64 = u64::try_from(count).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            if sb.free_blocks_count() < count_u64 {
+                return Err(Ext4Error::new(ErrCode::ENOSPC));
+            }
+
+            let mut blocks = Vec::new();
+            blocks
+                .try_reserve_exact(count)
+                .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            let mut groups = Vec::new();
+            let bg_count = sb.block_group_count();
+            groups
+                .try_reserve_exact(core::cmp::min(count, bg_count as usize))
+                .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            let preferred_bgid = ((inode.id - 1) / sb.inodes_per_group()) as BlockGroupId;
+            let checksum_bytes = sb.clusters_per_group() as usize / 8;
+            let metadata_csum =
+                sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM);
+
+            for offset in 0..bg_count {
+                if blocks.len() == count {
+                    break;
+                }
+                let bgid = (preferred_bgid + offset) % bg_count;
+                let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+                if blocks_in_group == 0 {
+                    continue;
+                }
+                let mut block_group = self.read_block_group(bgid)?;
+                if block_group.desc.get_free_blocks_count() == 0 {
+                    continue;
+                }
+                let bitmap_home = block_group.desc.block_bitmap_block();
+                let mut bitmap = self.read_block(bitmap_home)?;
+                self.prepare_stats.record_bitmap_io();
+                if metadata_csum {
+                    if !block_group.verify_checksum(sb.metadata_checksum_seed()) {
+                        return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
+                    }
+                    if !block_group.desc.verify_block_bitmap_csum(
+                        sb.metadata_checksum_seed(),
+                        &*bitmap.data,
+                        checksum_bytes,
+                    ) {
+                        return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
+                    }
+                }
+
+                let old_bitmap = bitmap.clone();
+                let group_first = Self::block_group_first_block(&sb, bgid);
+                let available = core::cmp::min(
+                    block_group.desc.get_free_blocks_count() as usize,
+                    count - blocks.len(),
+                );
+                let mut allocated = 0usize;
+                {
+                    let mut bitmap_bits = Bitmap::new(&mut *bitmap.data, blocks_in_group);
+                    while allocated < available {
+                        let Some(bit) =
+                            bitmap_bits.find_and_set_first_clear_bit(0, blocks_in_group)
+                        else {
+                            break;
+                        };
+                        let pblock = group_first
+                            .checked_add(bit as PBlockId)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+                        self.validate_data_blocks(pblock, 1)?;
+                        blocks.push(pblock);
+                        allocated += 1;
+                    }
+                }
+                if allocated == 0 {
+                    continue;
+                }
+                if !block_group.desc.update_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    &*bitmap.data,
+                    checksum_bytes,
+                ) {
+                    return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+                }
+                block_group.desc.set_free_blocks_count(
+                    block_group
+                        .desc
+                        .get_free_blocks_count()
+                        .checked_sub(allocated as u64)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+                );
+                groups.push(DeferredDataGroup {
+                    bitmap,
+                    old_bitmap,
+                    block_group,
+                });
+            }
+            if blocks.len() != count {
+                return Err(Ext4Error::new(ErrCode::ENOSPC));
+            }
+
+            // Several group descriptors share a GDT home block. Build each
+            // final image once so cross-group fallback writes do not turn into
+            // one read/modify/write cycle per descriptor.
+            let mut gdt_blocks = Vec::new();
+            gdt_blocks
+                .try_reserve_exact(groups.len())
+                .map_err(|_| Ext4Error::new(ErrCode::ENOMEM))?;
+            for group in groups.iter_mut() {
+                group.block_group.set_checksum(sb.metadata_checksum_seed());
+                let (gdt_home, offset) = self.block_group_disk_pos(group.block_group.id)?;
+                let gdt_index = match gdt_blocks
+                    .iter()
+                    .position(|gdt: &DeferredGdtBlock| gdt.image.id == gdt_home)
+                {
+                    Some(index) => index,
+                    None => {
+                        let image = self.read_block(gdt_home)?;
+                        self.prepare_stats.record_gdt_io();
+                        gdt_blocks.push(DeferredGdtBlock {
+                            old_image: image.clone(),
+                            image,
+                        });
+                        gdt_blocks.len() - 1
+                    }
+                };
+                gdt_blocks[gdt_index]
+                    .image
+                    .write_offset_as(offset, &group.block_group.desc);
+            }
+
+            // Data initialization precedes every allocation metadata write.
+            for pblock in blocks.iter().copied() {
+                self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
+                self.prepare_stats.record_zero_io();
+            }
+
+            sb.set_free_blocks_count(
+                sb.free_blocks_count()
+                    .checked_sub(count_u64)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+            );
+            let published = (|| {
+                for group in groups.iter_mut() {
+                    self.write_block(&group.bitmap)?;
+                    self.prepare_stats.record_bitmap_io();
+                }
+                for gdt in gdt_blocks.iter() {
+                    self.write_block(&gdt.image)?;
+                    self.prepare_stats.record_gdt_io();
+                }
+                self.write_super_block(&sb)?;
+                self.block_device.flush()
+            })();
+            if let Err(error) = published {
+                let rollback = (|| {
+                    for group in groups.iter().rev() {
+                        self.write_block(&group.old_bitmap)?;
+                    }
+                    for gdt in gdt_blocks.iter().rev() {
+                        self.write_block(&gdt.old_image)?;
+                    }
+                    self.write_super_block(&old_sb)?;
+                    self.block_device.flush()
+                })();
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                };
+            }
+            for group in groups.iter() {
+                if let Some(cached) = self.cached_block_groups.get(group.block_group.id as usize) {
+                    *cached.lock() = group.block_group.desc;
+                }
+            }
+            Ok(blocks)
+        })();
+        self.prepare_stats.record_phase(
+            super::PreparePhase::Allocation,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
+    }
+
     fn restore_inode_allocation_state(
         &self,
         bitmap_block: &Block,
@@ -439,6 +653,80 @@ impl Ext4 {
         Ok(inode_ref)
     }
 
+    /// Create a symbolic-link inode with its target initialized before linking.
+    pub(super) fn create_symlink_inode_with_owner(
+        &self,
+        target: &[u8],
+        owner: InodeOwner,
+    ) -> Result<InodeRef> {
+        let target_size =
+            u64::try_from(target.len()).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+        let id = self.alloc_inode(false)?;
+        let generation = match self.next_inode_generation(id) {
+            Ok(generation) => generation,
+            Err(error) => {
+                if self.rollback_new_inode(id, false).is_err() {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
+        };
+        let mut inode = Box::new(Inode::default());
+        inode.set_generation(generation);
+        inode.set_mode(InodeMode::from_type_and_perm(
+            FileType::SymLink,
+            InodeMode::ALL_RWX,
+        ));
+        inode.set_uid(owner.uid);
+        inode.set_gid(owner.gid);
+        let mut child = InodeRef::new(id, inode);
+
+        if target.len() <= child.inode.inline_block().len() {
+            child.inode.inline_block_mut()[..target.len()].copy_from_slice(target);
+            child.inode.set_size(target_size);
+            if let Err(error) = self.write_inode_with_csum(&mut child) {
+                if self.rollback_new_inode(id, false).is_err() {
+                    self.poison(ErrCode::EIO);
+                }
+                return Err(error);
+            }
+            return Ok(child);
+        }
+
+        child.inode.extent_init();
+        let initialized = (|| {
+            for (index, chunk) in target.chunks(BLOCK_SIZE).enumerate() {
+                let lblock = u32::try_from(index).map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+                let mut image = Box::new([0; BLOCK_SIZE]);
+                image[..chunk.len()].copy_from_slice(chunk);
+                self.extent_query_or_create_initialized(&mut child, lblock, 1, Some(image))?;
+            }
+            let data_blocks = u64::try_from(self.extent_all_data_blocks(&child)?.len())
+                .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            let tree_blocks = u64::try_from(self.extent_all_tree_blocks(&child)?.len())
+                .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            let sectors_per_block = u64::try_from(BLOCK_SIZE / INODE_BLOCK_SIZE)
+                .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+            child.inode.set_block_count(
+                data_blocks
+                    .checked_add(tree_blocks)
+                    .and_then(|blocks| blocks.checked_mul(sectors_per_block))
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?,
+            );
+            child.inode.set_size(target_size);
+            self.write_inode_with_csum(&mut child)
+        })();
+        match initialized {
+            Ok(()) => Ok(child),
+            Err(error) => {
+                if self.free_inode(&mut child).is_err() {
+                    self.poison(ErrCode::EIO);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Create a device inode (character or block device).
     ///
     /// Unlike `create_inode()`, this function:
@@ -513,15 +801,15 @@ impl Ext4 {
     /// Free an allocated inode and all data blocks allocated for it
     pub(super) fn free_inode(&self, inode: &mut InodeRef) -> Result<()> {
         let inode_id = inode.id;
-        // Free the data blocks allocated for the inode
-        let pblocks = self.extent_all_data_blocks(inode)?;
-        for pblock in pblocks {
-            self.dealloc_block(inode, pblock)?;
-        }
-        // Free extent tree
-        let pblocks = self.extent_all_tree_blocks(inode)?;
-        for pblock in pblocks {
-            self.dealloc_block(inode, pblock)?;
+        if inode.inode.uses_extents() {
+            let pblocks = self.extent_all_data_blocks(inode)?;
+            for pblock in pblocks {
+                self.dealloc_block(inode, pblock)?;
+            }
+            let pblocks = self.extent_all_tree_blocks(inode)?;
+            for pblock in pblocks {
+                self.dealloc_block(inode, pblock)?;
+            }
         }
         // Free xattr block
         let xattr_block = inode.inode.xattr_block();
@@ -889,85 +1177,94 @@ impl Ext4 {
 
     /// Allocate a new physical block for an inode, return the physical block number
     pub(super) fn alloc_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
-        let _alloc_guard = self.alloc_lock.lock();
-        let mut sb = self.read_super_block_cached();
-        let inodes_per_group = sb.inodes_per_group();
-        let preferred_bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
-        let bg_count = sb.block_group_count();
+        let start = self.prepare_stats.phase_start(self.block_device.as_ref());
+        let result = (|| {
+            let _alloc_guard = self.alloc_lock.lock();
+            let mut sb = self.read_super_block_cached();
+            let inodes_per_group = sb.inodes_per_group();
+            let preferred_bgid = ((inode.id - 1) / inodes_per_group) as BlockGroupId;
+            let bg_count = sb.block_group_count();
 
-        for i in 0..bg_count {
-            let bgid = (preferred_bgid + i) % bg_count;
-            let blocks_in_group = Self::block_group_block_count(&sb, bgid);
-            if blocks_in_group == 0 {
-                continue;
-            }
-
-            // Load block group descriptor
-            let mut bg = self.read_block_group(bgid)?;
-            if bg.desc.get_free_blocks_count() == 0 {
-                continue;
-            }
-
-            // Load block bitmap. Bits are relative to the start of this block group;
-            // extent physical block numbers are absolute filesystem block numbers.
-            let bitmap_block_id = bg.desc.block_bitmap_block();
-            let mut bitmap_block = self.read_block(bitmap_block_id)?;
-            self.prepare_stats.record_bitmap_io();
-            let old_bitmap_block = bitmap_block.clone();
-            let old_bg = BlockGroupRef::new(bg.id, bg.desc);
-            let old_sb = sb;
-            let bit = {
-                let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
-                match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
-                    Some(bit) => bit,
-                    None => continue,
+            for i in 0..bg_count {
+                let bgid = (preferred_bgid + i) % bg_count;
+                let blocks_in_group = Self::block_group_block_count(&sb, bgid);
+                if blocks_in_group == 0 {
+                    continue;
                 }
-            };
-            let fblock = Self::block_group_first_block(&sb, bgid) + bit as PBlockId;
 
-            // Set block group checksum
-            if !bg.desc.update_block_bitmap_csum(
-                sb.metadata_checksum_seed(),
-                &*bitmap_block.data,
-                sb.clusters_per_group() as usize / 8,
-            ) {
-                return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
-            }
-            self.write_block(&bitmap_block)?;
-            self.prepare_stats.record_bitmap_io();
+                // Load block group descriptor
+                let mut bg = self.read_block_group(bgid)?;
+                if bg.desc.get_free_blocks_count() == 0 {
+                    continue;
+                }
 
-            // Update block group counters
-            bg.desc
-                .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
-            if let Err(err) = self.write_block_group_with_csum(&mut bg) {
-                return match self.restore_block_allocation_state(
-                    &old_bitmap_block,
-                    &old_bg,
-                    &old_sb,
-                ) {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(rollback_err),
+                // Load block bitmap. Bits are relative to the start of this block group;
+                // extent physical block numbers are absolute filesystem block numbers.
+                let bitmap_block_id = bg.desc.block_bitmap_block();
+                let mut bitmap_block = self.read_block(bitmap_block_id)?;
+                self.prepare_stats.record_bitmap_io();
+                let old_bitmap_block = bitmap_block.clone();
+                let old_bg = BlockGroupRef::new(bg.id, bg.desc);
+                let old_sb = sb;
+                let bit = {
+                    let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
+                    match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
+                        Some(bit) => bit,
+                        None => continue,
+                    }
                 };
-            }
+                let fblock = Self::block_group_first_block(&sb, bgid) + bit as PBlockId;
 
-            // Update superblock counters
-            sb.set_free_blocks_count(sb.free_blocks_count() - 1);
-            if let Err(err) = self.write_super_block(&sb) {
-                return match self.restore_block_allocation_state(
-                    &old_bitmap_block,
-                    &old_bg,
-                    &old_sb,
+                // Set block group checksum
+                if !bg.desc.update_block_bitmap_csum(
+                    sb.metadata_checksum_seed(),
+                    &*bitmap_block.data,
+                    sb.clusters_per_group() as usize / 8,
                 ) {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(rollback_err),
-                };
+                    return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+                }
+                self.write_block(&bitmap_block)?;
+                self.prepare_stats.record_bitmap_io();
+
+                // Update block group counters
+                bg.desc
+                    .set_free_blocks_count(bg.desc.get_free_blocks_count() - 1);
+                if let Err(err) = self.write_block_group_with_csum(&mut bg) {
+                    return match self.restore_block_allocation_state(
+                        &old_bitmap_block,
+                        &old_bg,
+                        &old_sb,
+                    ) {
+                        Ok(()) => Err(err),
+                        Err(rollback_err) => Err(rollback_err),
+                    };
+                }
+
+                // Update superblock counters
+                sb.set_free_blocks_count(sb.free_blocks_count() - 1);
+                if let Err(err) = self.write_super_block(&sb) {
+                    return match self.restore_block_allocation_state(
+                        &old_bitmap_block,
+                        &old_bg,
+                        &old_sb,
+                    ) {
+                        Ok(()) => Err(err),
+                        Err(rollback_err) => Err(rollback_err),
+                    };
+                }
+
+                trace!("Alloc block {} ok", fblock);
+                return Ok(fblock);
             }
 
-            trace!("Alloc block {} ok", fblock);
-            return Ok(fblock);
-        }
-
-        return_error!(ErrCode::ENOSPC, "No free blocks in filesystem");
+            return_error!(ErrCode::ENOSPC, "No free blocks in filesystem");
+        })();
+        self.prepare_stats.record_phase(
+            super::PreparePhase::Allocation,
+            start,
+            self.block_device.as_ref(),
+        );
+        result
     }
 
     /// Allocate and initialize a data block before any extent can publish it.
