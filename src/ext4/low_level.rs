@@ -11,7 +11,7 @@ use crate::prelude::*;
 use crate::return_error;
 use core::cmp::min;
 
-const DIRECT_RANGE_MIN_BLOCKS: usize = 16;
+const DIRECT_RANGE_MIN_BLOCKS: usize = 4;
 const DIRECT_RANGE_MAX_BLOCKS: usize = 256;
 const DIRECT_RANGE_ZERO_CHUNK_BLOCKS: usize = 8;
 /// Bound the metadata footprint of a writeback batch. Journal-ring pressure
@@ -538,6 +538,7 @@ impl Ext4 {
         &self,
         inode: &mut InodeRef,
         range: &WriteLogicalRange,
+        skip_zero: bool,
     ) -> Result<()> {
         self.prepare_stats.record_call();
         let mut allocation_attempted = false;
@@ -567,7 +568,11 @@ impl Ext4 {
                 // Allocate and initialize all missing data before the one-per-
                 // group bitmap/GDT/superblock publish.  Extents are installed
                 // only after that metadata is durable.
-                let allocated = self.alloc_zeroed_data_blocks(inode, missing_lblocks.len())?;
+                let allocated = self.alloc_zeroed_data_blocks(
+                    inode,
+                    missing_lblocks.len(),
+                    skip_zero,
+                )?;
                 let mut allocation_index = 0usize;
                 while allocation_index < allocated.len() {
                     let first_lblock = missing_lblocks[allocation_index];
@@ -661,7 +666,7 @@ impl Ext4 {
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
-        self.ensure_blocks_for_write_range_locked(&mut inode, &range)
+        self.ensure_blocks_for_write_range_locked(&mut inode, &range, false)
     }
 
     /// Prepare a buffered write by allocating only the written range.
@@ -761,7 +766,7 @@ impl Ext4 {
             if inode.inode.mode().bits() == 0 {
                 return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
             }
-            self.ensure_blocks_for_write_range_locked(&mut inode, &range)?;
+            self.ensure_blocks_for_write_range_locked(&mut inode, &range, real_data.is_some())?;
             // The mutation guard serializes same-inode mutation, while the
             // token rejects any mapping commit that raced elsewhere. Never
             // publish an I/O-derived extent under a newer cache epoch.
@@ -1204,7 +1209,7 @@ impl Ext4 {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }
 
-        self.ensure_blocks_for_write_range_locked(&mut file, &range)?;
+        self.ensure_blocks_for_write_range_locked(&mut file, &range, false)?;
 
         // Write data
         let mut cursor = 0;

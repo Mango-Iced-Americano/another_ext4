@@ -56,9 +56,11 @@ fn linked_orphan_tail_remove_limit(
 }
 
 impl Ext4 {
-    /// Allocate and zero data blocks before publishing their allocation
-    /// metadata.  Every touched bitmap and group descriptor is written once,
-    /// and the superblock is updated once after all data initialization.
+    /// Allocate data blocks before publishing their allocation metadata.
+    /// Unless the caller will immediately write complete replacement data,
+    /// initialize every allocated block to zero. Every touched bitmap and
+    /// group descriptor is written once, and the superblock is updated once
+    /// after data initialization when it is required.
     ///
     /// The caller must publish the matching extents only after this returns.
     /// Thus a crash can leave initialized, unreachable blocks allocated, but
@@ -67,6 +69,7 @@ impl Ext4 {
         &self,
         inode: &InodeRef,
         count: usize,
+        skip_zero: bool,
     ) -> Result<Vec<PBlockId>> {
         if count == 0 {
             return Ok(Vec::new());
@@ -205,10 +208,12 @@ impl Ext4 {
                     .write_offset_as(offset, &group.block_group.desc);
             }
 
-            // Data initialization precedes every allocation metadata write.
-            for pblock in blocks.iter().copied() {
-                self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
-                self.prepare_stats.record_zero_io();
+            if !skip_zero {
+                // Data initialization precedes every allocation metadata write.
+                for pblock in blocks.iter().copied() {
+                    self.write_block(&Block::new(pblock, Box::new([0; BLOCK_SIZE])))?;
+                    self.prepare_stats.record_zero_io();
+                }
             }
 
             sb.set_free_blocks_count(
