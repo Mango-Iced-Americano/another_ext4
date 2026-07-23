@@ -142,12 +142,7 @@ impl Ext4 {
             );
             return Ok(None);
         };
-        crate::println!(
-            "[ext4_diag] plan_accept lblock={} count={} merge={}",
-            range.first_lblock,
-            count,
-            shape.requires_merge
-        );
+        // [ext4_diag] plan_accept — commented out to reduce serial noise
         Ok(Some(DirectRangePlan {
             start_lblock: range.first_lblock,
             count,
@@ -263,21 +258,11 @@ impl Ext4 {
         self.prepare_stats.record_inode_io();
         match real_data {
             Some(_) => {
-                crate::println!(
-                    "[ext4_diag] direct_ok:data_written lblock={} count={} pblock={}",
-                    plan.start_lblock,
-                    plan.count,
-                    allocation.first
-                );
+        // [ext4_diag] direct_ok:data_written — commented out
                 Ok(DirectRangePrepare::DataWritten)
             }
             None => {
-                crate::println!(
-                    "[ext4_diag] direct_ok:initialized lblock={} count={} pblock={}",
-                    plan.start_lblock,
-                    plan.count,
-                    allocation.first
-                );
+        // [ext4_diag] direct_ok:initialized — commented out
                 Ok(DirectRangePrepare::Initialized)
             }
         }
