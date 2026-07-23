@@ -313,6 +313,7 @@ impl Ext4 {
         if count == 0 {
             return_error!(ErrCode::EINVAL, "Cannot allocate an empty block range");
         }
+        let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.transaction_read_super_block(transaction)?;
         self.prepare_stats.record_superblock_io();
         let bg_count = sb.block_group_count();
