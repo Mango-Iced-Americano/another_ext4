@@ -52,6 +52,7 @@ pub struct BlockGroupDesc {
 unsafe impl AsBytes for BlockGroupDesc {}
 
 impl BlockGroupDesc {
+    const BLOCK_UNINIT: u16 = 0x0002;
     #[allow(unused)]
     const MIN_BLOCK_GROUP_DESC_SIZE: usize = 32;
     #[allow(unused)]
@@ -63,6 +64,14 @@ impl BlockGroupDesc {
 
     pub fn inode_bitmap_block(&self) -> PBlockId {
         ((self.inode_bitmap_hi as PBlockId) << 32) | self.inode_bitmap_lo as PBlockId
+    }
+
+    pub fn block_bitmap_uninitialized(&self) -> bool {
+        self.flags & Self::BLOCK_UNINIT != 0
+    }
+
+    pub fn mark_block_bitmap_initialized(&mut self) {
+        self.flags &= !Self::BLOCK_UNINIT;
     }
 
     pub fn itable_unused(&self) -> u32 {

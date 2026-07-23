@@ -77,6 +77,7 @@ impl Ext4 {
 
         let start = self.prepare_stats.phase_start(self.block_device.as_ref());
         let result = (|| {
+            let _metadata_guard = self.lock_direct_metadata_mutation()?;
             let _alloc_guard = self.alloc_lock.lock();
             let mut sb = self.read_super_block_cached();
             let old_sb = sb;
@@ -119,17 +120,26 @@ impl Ext4 {
                     if !block_group.verify_checksum(sb.metadata_checksum_seed()) {
                         return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
                     }
-                    if !block_group.desc.verify_block_bitmap_csum(
-                        sb.metadata_checksum_seed(),
-                        &*bitmap.data,
-                        checksum_bytes,
-                    ) {
+                    if !block_group.desc.block_bitmap_uninitialized()
+                        && !block_group.desc.verify_block_bitmap_csum(
+                            sb.metadata_checksum_seed(),
+                            &*bitmap.data,
+                            checksum_bytes,
+                        ) {
                         return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
                     }
                 }
 
-                let old_bitmap = bitmap.clone();
                 let group_first = Self::block_group_first_block(&sb, bgid);
+                let old_bitmap = bitmap.clone();
+                if block_group.desc.block_bitmap_uninitialized() {
+                    self.initialize_block_bitmap(
+                        &sb,
+                        &mut block_group,
+                        &mut *bitmap.data,
+                        blocks_in_group,
+                    )?;
+                }
                 let available = core::cmp::min(
                     block_group.desc.get_free_blocks_count() as usize,
                     count - blocks.len(),
@@ -298,6 +308,53 @@ impl Ext4 {
         core::cmp::min(sb.blocks_per_group() as u64, total - first) as usize
     }
 
+    /// Materialize a BLOCK_UNINIT bitmap without exposing filesystem metadata
+    /// as allocatable file data. Metadata ranges include flex_bg-relocated
+    /// bitmaps and inode tables; unsupported meta_bg filesystems are rejected
+    /// during mount validation before this allocator can run.
+    fn initialize_block_bitmap(
+        &self,
+        sb: &SuperBlock,
+        bg: &mut BlockGroupRef,
+        image: &mut [u8; BLOCK_SIZE],
+        blocks_in_group: usize,
+    ) -> Result<()> {
+        image.fill(0);
+
+        let group_first = Self::block_group_first_block(sb, bg.id);
+        let group_end = group_first
+            .checked_add(blocks_in_group as PBlockId)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let metadata_ranges = Self::build_system_metadata_ranges(sb, &self.cached_block_groups)?;
+        let mut bitmap = Bitmap::new(image, blocks_in_group);
+        for (start, end) in metadata_ranges {
+            let start = core::cmp::max(start, group_first);
+            let end = core::cmp::min(end, group_end);
+            for block in start..end {
+                let bit = usize::try_from(block - group_first)
+                    .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+                bitmap.set_bit(bit);
+            }
+        }
+        drop(bitmap);
+
+        // The bitmap checksum covers a full group even when the final group is
+        // smaller, so its non-existent tail must never look allocatable.
+        for bit in blocks_in_group..sb.blocks_per_group() as usize {
+            image[bit / 8] |= 1 << (bit % 8);
+        }
+
+        bg.desc.mark_block_bitmap_initialized();
+        if !bg.desc.update_block_bitmap_csum(
+            sb.metadata_checksum_seed(),
+            image,
+            sb.clusters_per_group() as usize / 8,
+        ) {
+            return_error!(ErrCode::EIO, "Invalid block bitmap checksum length");
+        }
+        Ok(())
+    }
+
     /// Stage one group-local contiguous data allocation without publishing
     /// any cache or disk metadata.  The caller owns the filesystem-wide
     /// transactional metadata gate, so no direct allocator can race the
@@ -340,20 +397,30 @@ impl Ext4 {
                 continue;
             }
             let bitmap_home = bg.desc.block_bitmap_block();
-            let bitmap_block = transaction.read(self.block_device.as_ref(), bitmap_home)?;
+            let mut bitmap_image = [0; BLOCK_SIZE];
+            {
+                let bitmap_block = transaction.read(self.block_device.as_ref(), bitmap_home)?;
+                bitmap_image.copy_from_slice(&*bitmap_block);
+            }
             self.prepare_stats.record_bitmap_io();
             let checksum_bytes = (sb.clusters_per_group() as usize) / 8;
             if sb.has_read_only_compatible_feature(SuperBlock::FEATURE_RO_COMPAT_METADATA_CSUM) {
                 if !bg.verify_checksum(sb.metadata_checksum_seed()) {
                     return_error!(ErrCode::EIO, "Corrupt block-group descriptor checksum");
                 }
-                if !bg.desc.verify_block_bitmap_csum(
-                    sb.metadata_checksum_seed(),
-                    &*bitmap_block,
-                    checksum_bytes,
-                ) {
+                if !bg.desc.block_bitmap_uninitialized()
+                    && !bg.desc.verify_block_bitmap_csum(
+                        sb.metadata_checksum_seed(),
+                        &bitmap_image,
+                        checksum_bytes,
+                    ) {
                     return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
                 }
+            }
+
+            let bitmap_was_uninitialized = bg.desc.block_bitmap_uninitialized();
+            if bitmap_was_uninitialized {
+                self.initialize_block_bitmap(&sb, &mut bg, &mut bitmap_image, blocks_in_group)?;
             }
 
             let group_first = Self::block_group_first_block(&sb, bgid);
@@ -365,13 +432,13 @@ impl Ext4 {
                     bit.checked_add(count_usize)
                         .is_some_and(|end| end <= blocks_in_group)
                         && (*bit..*bit + count_usize)
-                            .all(|index| bitmap_block[index / 8] & (1 << (index % 8)) == 0)
+                            .all(|index| bitmap_image[index / 8] & (1 << (index % 8)) == 0)
                 });
             let bit = exact_hint.or_else(|| {
                 (!require_preferred)
                     .then(|| {
                         Bitmap::first_clear_run_in(
-                            &*bitmap_block,
+                            &bitmap_image,
                             blocks_in_group,
                             0,
                             blocks_in_group,
@@ -398,6 +465,9 @@ impl Ext4 {
             {
                 let image = self.transaction_block_for_update(transaction, bitmap_home)?;
                 self.prepare_stats.record_bitmap_io();
+                if bitmap_was_uninitialized {
+                    image.copy_from_slice(&bitmap_image);
+                }
                 let mut bitmap = Bitmap::new(image, blocks_in_group);
                 if (bit..bit + count_usize).any(|index| !bitmap.is_bit_clear(index)) {
                     return_error!(ErrCode::EIO, "Direct range changed during planning");
@@ -1183,6 +1253,7 @@ impl Ext4 {
 
     /// Allocate a new physical block for an inode, return the physical block number
     pub(super) fn alloc_block(&self, inode: &mut InodeRef) -> Result<PBlockId> {
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let start = self.prepare_stats.phase_start(self.block_device.as_ref());
         let result = (|| {
             let _alloc_guard = self.alloc_lock.lock();
@@ -1212,6 +1283,14 @@ impl Ext4 {
                 let old_bitmap_block = bitmap_block.clone();
                 let old_bg = BlockGroupRef::new(bg.id, bg.desc);
                 let old_sb = sb;
+                if bg.desc.block_bitmap_uninitialized() {
+                    self.initialize_block_bitmap(
+                        &sb,
+                        &mut bg,
+                        &mut *bitmap_block.data,
+                        blocks_in_group,
+                    )?;
+                }
                 let bit = {
                     let mut bitmap = Bitmap::new(&mut *bitmap_block.data, blocks_in_group);
                     match bitmap.find_and_set_first_clear_bit(0, blocks_in_group) {
@@ -1303,6 +1382,7 @@ impl Ext4 {
 
     /// Deallocate a physical block allocated for an inode
     pub(super) fn dealloc_block(&self, _inode: &mut InodeRef, pblock: PBlockId) -> Result<()> {
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.read_super_block_cached();
         if pblock >= sb.block_count() {
@@ -1372,6 +1452,7 @@ impl Ext4 {
 
     /// Allocate a new inode, returning the inode number.
     fn alloc_inode(&self, is_dir: bool) -> Result<InodeId> {
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.read_super_block_cached();
         let bg_count = sb.block_group_count();
@@ -1459,6 +1540,7 @@ impl Ext4 {
 
     /// Free an inode
     fn dealloc_inode(&self, inode_ref: &mut InodeRef) -> Result<()> {
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _alloc_guard = self.alloc_lock.lock();
         let mut sb = self.read_super_block_cached();
 
