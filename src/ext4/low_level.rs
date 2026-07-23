@@ -823,7 +823,7 @@ impl Ext4 {
             if inode.inode.mode().bits() == 0 {
                 return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
             }
-            self.ensure_blocks_for_write_range_locked(&mut inode, &range, real_data.is_some())?;
+            self.ensure_blocks_for_write_range_locked(&mut inode, &range, false)?;
             // The mutation guard serializes same-inode mutation, while the
             // token rejects any mapping commit that raced elsewhere. Never
             // publish an I/O-derived extent under a newer cache epoch.
