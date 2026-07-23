@@ -11,6 +11,13 @@ use crate::prelude::*;
 use crate::return_error;
 use core::cmp::min;
 
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        log::info!($($arg)*);
+    };
+}
+
 const DIRECT_RANGE_MIN_BLOCKS: usize = 4;
 const DIRECT_RANGE_MAX_BLOCKS: usize = 256;
 const DIRECT_RANGE_ZERO_CHUNK_BLOCKS: usize = 8;
