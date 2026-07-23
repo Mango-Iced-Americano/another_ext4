@@ -118,16 +118,8 @@ impl Ext4 {
     }
 
     pub fn flush_device(&self) -> Result<()> {
-        if let MetadataMutationMode::Journal(core) = &self.metadata_mode {
+        if matches!(self.metadata_mode, MetadataMutationMode::Journal(_)) {
             self.flush_deferred_journal()?;
-            match core.force_checkpoint(self.block_device.as_ref()) {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(error) => {
-                    self.poison(ErrCode::EIO);
-                    return Err(error);
-                }
-            }
         }
         self.block_device.flush()
     }
@@ -211,16 +203,12 @@ impl Ext4 {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
         self.flush_deferred_journal()?;
-        if let Err(error) = journal.force_checkpoint(self.block_device.as_ref()) {
-            self.poison(ErrCode::EIO);
-            return Err(error);
-        }
         if !journal.can_shutdown() {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
-        // Deferred checkpoints are complete and new writers are excluded by
-        // VFS umount, so it is now safe to clear RECOVER as Linux does at a
-        // clean shutdown.
+        // Every journal commit checkpoints synchronously and new writers are
+        // excluded by VFS umount, so it is now safe to clear RECOVER as Linux
+        // does at a clean shutdown.
         let mut sb = self.read_super_block_cached();
         sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, false);
         self.write_super_block(&sb)?;
@@ -362,7 +350,6 @@ impl Ext4 {
                     target_blocks: ext4_sb.block_count(),
                     head,
                     superblock_image: image,
-                    deferred_checkpoint: None,
                     deferred_transaction: None,
                 },
             )?);
