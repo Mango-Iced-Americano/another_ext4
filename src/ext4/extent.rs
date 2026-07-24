@@ -1169,6 +1169,7 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepared_extents: spin::Mutex::new(crate::ext4::prepared_extent::PreparedExtentCache::new()),
             prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }
@@ -1201,6 +1202,7 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepared_extents: spin::Mutex::new(crate::ext4::prepared_extent::PreparedExtentCache::new()),
             prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }

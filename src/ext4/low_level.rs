@@ -276,22 +276,43 @@ impl Ext4 {
     /// free allocation metadata.
     fn try_prepare_journal_range(
         &self,
-        inode: &mut InodeRef,
+        inode_id: InodeId,
         range: &WriteLogicalRange,
         real_data: Option<&[u8]>,
     ) -> Result<DirectRangePrepare> {
-        let Some(plan) = self.direct_range_plan(inode, range)? else {
-            return Ok(DirectRangePrepare::Unsupported);
+        // Read through the active transaction so consecutive deferred batches
+        // extend the latest staged inode image instead of overwriting it.
+        let mut transaction = self.transaction_start(4)?;
+        let mut inode = self.transaction_read_inode(&transaction, inode_id)?;
+        if inode.inode.mode().bits() == 0 {
+            transaction.abort();
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", inode_id);
+        }
+        let plan = match self.direct_range_plan(&inode, range) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                transaction.abort();
+                return Ok(DirectRangePrepare::Unsupported);
+            }
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
         };
 
-        let total = (plan.count as usize)
-            .checked_mul(BLOCK_SIZE)
-            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        let total = match (plan.count as usize).checked_mul(BLOCK_SIZE) {
+            Some(total) => total,
+            None => {
+                transaction.abort();
+                return Err(Ext4Error::new(ErrCode::EFBIG));
+            }
+        };
         let real_data = real_data.and_then(|data| data.get(..total));
         let zeros = if real_data.is_none() {
             let zero_bytes = DIRECT_RANGE_ZERO_CHUNK_BLOCKS * BLOCK_SIZE;
             let mut zeros = Vec::new();
             if zeros.try_reserve_exact(zero_bytes).is_err() {
+                transaction.abort();
                 return Ok(DirectRangePrepare::Unsupported);
             }
             zeros.resize(zero_bytes, 0);
@@ -302,7 +323,6 @@ impl Ext4 {
 
         // The range fits one block group, so bitmap, GDT, superblock, and inode
         // are the complete bounded set of transaction homes.
-        let mut transaction = self.transaction_start(4)?;
         let allocation = match self.transaction_alloc_direct_range(
             &mut transaction,
             inode.id,
@@ -315,7 +335,10 @@ impl Ext4 {
                 transaction.abort();
                 return Ok(DirectRangePrepare::Unsupported);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                transaction.abort();
+                return Err(error);
+            }
         };
 
         self.prepare_stats.record_call();
@@ -342,13 +365,18 @@ impl Ext4 {
         }
 
         if let Err(error) =
-            self.stage_direct_append_extent(inode, plan.start_lblock, allocation.first, plan.count)
+            self.stage_direct_append_extent(
+                &mut inode,
+                plan.start_lblock,
+                allocation.first,
+                plan.count,
+            )
         {
             self.prepare_stats.record_failure();
             transaction.abort();
             return Err(error);
         }
-        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, inode) {
+        if let Err(error) = self.transaction_stage_inode_with_csum(&mut transaction, &mut inode) {
             self.prepare_stats.record_failure();
             transaction.abort();
             return Err(error);
@@ -744,52 +772,33 @@ impl Ext4 {
         let Some(range) = Self::checked_write_logical_range(offset, len)? else {
             return Ok(false);
         };
-        // P0 mapped overwrite fast path: if the full range is already mapped,
-        // write_data_only() handles it directly without any allocation overhead.
-        if let Some(data) = real_data.and_then(|data| data.get(..len)) {
-            match self.write_data_only(id, offset, data) {
-                Ok(written) if written == len => return Ok(true),
-                Ok(_) => return Err(Ext4Error::new(ErrCode::EIO)),
-                Err(error) if error.code() == ErrCode::ENOENT => {
-                    // Has holes — fall through to normal allocation path.
-                    // write_data_only() hasn't written anything for ENOENT,
-                    // so no partial data to clean up.
+        // A direct data-only write flushes the deferred journal to obtain a
+        // stable extent map.  Journaled appends must prepare through their
+        // transaction first, otherwise each following write forces a commit.
+        if !self.uses_journal() {
+            if let Some(data) = real_data.and_then(|data| data.get(..len)) {
+                match self.write_data_only(id, offset, data) {
+                    Ok(written) if written == len => return Ok(true),
+                    Ok(_) => return Err(Ext4Error::new(ErrCode::EIO)),
+                    Err(error) if error.code() == ErrCode::ENOENT => {
+                        // Has holes — fall through to normal allocation path.
+                        // write_data_only() hasn't written anything for ENOENT,
+                        // so no partial data to clean up.
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
         if self.uses_journal() {
-            let journal_range_supported = {
+            let outcome = {
                 let _metadata_guard = self.lock_transactional_metadata_mutation()?;
                 let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
-                let inode = self.read_inode(id)?;
-                if inode.inode.mode().bits() == 0 {
-                    return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
-                }
-                self.direct_range_plan(&inode, &range)?.is_some()
+                self.try_prepare_journal_range(id, &range, real_data)?
             };
-            if !journal_range_supported {
-                crate::println!(
-                    "[ext4_diag] fallback:no_journal_range lblock={} count={}",
-                    range.first_lblock,
-                    range.block_count
-                );
-            }
-            if journal_range_supported {
-                let outcome = {
-                    let _metadata_guard = self.lock_transactional_metadata_mutation()?;
-                    let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
-                    let mut inode = self.read_inode(id)?;
-                    if inode.inode.mode().bits() == 0 {
-                        return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
-                    }
-                    self.try_prepare_journal_range(&mut inode, &range, real_data)?
-                };
-                match outcome {
-                    DirectRangePrepare::DataWritten => return Ok(true),
-                    DirectRangePrepare::Initialized => return Ok(false),
-                    DirectRangePrepare::Unsupported => {}
-                }
+            match outcome {
+                DirectRangePrepare::DataWritten => return Ok(true),
+                DirectRangePrepare::Initialized => return Ok(false),
+                DirectRangePrepare::Unsupported => {}
             }
         }
         if self.supports_direct_range_stage() {
@@ -2274,6 +2283,7 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
+            prepared_extents: spin::Mutex::new(crate::ext4::prepared_extent::PreparedExtentCache::new()),
             prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }

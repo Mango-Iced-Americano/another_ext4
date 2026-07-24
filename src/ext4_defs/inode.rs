@@ -966,6 +966,7 @@ mod tests {
         fn test_file_attr_rdev_field() {
             let attr = FileAttr {
                 ino: 123,
+                generation: 0,
                 size: 0,
                 atime: 0,
                 mtime: 0,
@@ -988,6 +989,7 @@ mod tests {
         fn test_file_attr_rdev_default_for_regular() {
             let attr = FileAttr {
                 ino: 456,
+                generation: 0,
                 size: 1024,
                 atime: 0,
                 mtime: 0,

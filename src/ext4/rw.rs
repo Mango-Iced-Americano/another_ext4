@@ -90,6 +90,20 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Read an inode through the transaction's latest staged block image.
+    pub(super) fn transaction_read_inode(
+        &self,
+        transaction: &super::journal_transaction::Transaction<'_>,
+        inode_id: InodeId,
+    ) -> Result<InodeRef> {
+        let (block_id, offset) = self.inode_disk_pos(inode_id)?;
+        let block = transaction.read(self.block_device.as_ref(), block_id)?;
+        Ok(InodeRef::new(
+            inode_id,
+            Box::new(Inode::from_bytes(&block[offset..])),
+        ))
+    }
+
     /// Read a block from block device
     pub(super) fn read_block(&self, block_id: PBlockId) -> Result<Block> {
         self.block_device.read_block(block_id)

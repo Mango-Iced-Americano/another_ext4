@@ -427,10 +427,7 @@ impl<'a> Transaction<'a> {
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
         let was_deferred = self.deferred_image(home).is_some();
-        if !self.staged.contains_key(&home)
-            && !was_deferred
-            && self.total_staged_len() == self.credits
-        {
+        if !self.staged.contains_key(&home) && !was_deferred && self.staged.len() == self.credits {
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
         self.staged.insert(
