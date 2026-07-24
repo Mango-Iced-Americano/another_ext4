@@ -744,6 +744,20 @@ impl Ext4 {
         let Some(range) = Self::checked_write_logical_range(offset, len)? else {
             return Ok(false);
         };
+        // P0 mapped overwrite fast path: if the full range is already mapped,
+        // write_data_only() handles it directly without any allocation overhead.
+        if let Some(data) = real_data.and_then(|data| data.get(..len)) {
+            match self.write_data_only(id, offset, data) {
+                Ok(written) if written == len => return Ok(true),
+                Ok(_) => return Err(Ext4Error::new(ErrCode::EIO)),
+                Err(error) if error.code() == ErrCode::ENOENT => {
+                    // Has holes — fall through to normal allocation path.
+                    // write_data_only() hasn't written anything for ENOENT,
+                    // so no partial data to clean up.
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if self.uses_journal() {
             let journal_range_supported = {
                 let _metadata_guard = self.lock_transactional_metadata_mutation()?;
