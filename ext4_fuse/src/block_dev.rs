@@ -82,26 +82,14 @@ impl BlockMem {
 }
 
 impl BlockDevice for BlockMem {
-    fn read_block(&self, block_id: u64) -> core::result::Result<Block, another_ext4::Ext4Error> {
-        let blocks = self.0.lock().unwrap();
-        let data = blocks
-            .get(block_id as usize)
-            .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
-        Ok(Block::new(block_id, Box::new(*data)))
+    fn read_block(&self, block_id: u64) -> Block {
+        Block {
+            id: block_id,
+            data: self.0.lock().unwrap()[block_id as usize],
+        }
     }
-    fn write_block(&self, block: &Block) -> core::result::Result<(), another_ext4::Ext4Error> {
-        let mut blocks = self.0.lock().unwrap();
-        let slot = blocks
-            .get_mut(block.id as usize)
-            .ok_or_else(|| another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO))?;
-        *slot = *block.data;
-        Ok(())
-    }
-    fn flush(&self) -> core::result::Result<(), another_ext4::Ext4Error> {
-        Ok(())
-    }
-    fn supports_reliable_flush(&self) -> bool {
-        true
+    fn write_block(&self, block: &Block) {
+        self.0.lock().unwrap()[block.id as usize] = block.data;
     }
 }
 
