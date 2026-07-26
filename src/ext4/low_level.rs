@@ -892,6 +892,123 @@ impl Ext4 {
         self.commit_inode_metadata(id, Some(size), None, mtime)
     }
 
+    /// Resize an inode and release every extent wholly or partially beyond EOF.
+    ///
+    /// Growing only changes `i_size`; shrinking removes extent tails in
+    /// block-group-local transactions before publishing the new size.
+    pub fn truncate_inode(&self, inode_id: InodeId, new_size: u64) -> Result<()> {
+        self.ensure_mutable()?;
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let _mutation_guard = self.lock_inode_mutation_for_prepare(inode_id);
+        self.flush_deferred_journal()?;
+
+        let inode = self.read_inode(inode_id)?;
+        if inode.inode.mode().bits() == 0 {
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", inode_id);
+        }
+        let old_size = inode.inode.size();
+        if old_size == new_size {
+            return Ok(());
+        }
+
+        let keep_blocks = new_size.div_ceil(BLOCK_SIZE as u64);
+        let mut tail_zeroed = false;
+        loop {
+            let mut transaction = self.transaction_start(32)?;
+            let mut inode = self.transaction_read_inode(&transaction, inode_id)?;
+            let tail = if new_size < old_size && inode.inode.uses_extents() {
+                self.extent_tail(&transaction, &inode)?
+            } else {
+                None
+            };
+
+            let tail_offset = new_size % BLOCK_SIZE as u64;
+            if !tail_zeroed && new_size < old_size && tail_offset != 0 {
+                let last_lblock: LBlockId = (new_size / BLOCK_SIZE as u64)
+                    .try_into()
+                    .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+                match self.extent_query(&inode, last_lblock) {
+                    Ok(last_pblock) => {
+                        let mut block = self.read_block(last_pblock)?;
+                        block.data[tail_offset as usize..].fill(0);
+                        self.write_block(&block)?;
+                    }
+                    // A sparse final block already reads as zero and must not be allocated.
+                    Err(error) if error.code() == ErrCode::ENOENT => {}
+                    Err(error) => return Err(error),
+                }
+                tail_zeroed = true;
+            }
+
+            let mut finished = true;
+            if let Some(tail) = tail {
+                let tail_end = tail
+                    .start_lblock
+                    .checked_add(tail.block_count)
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                if u64::from(tail_end) > keep_blocks {
+                    let tail_end_pblock = tail
+                        .start_pblock
+                        .checked_add(tail.block_count as PBlockId)
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                    let super_block = self.read_super_block_cached();
+                    let first_data_block = super_block.first_data_block() as PBlockId;
+                    if tail.start_pblock < first_data_block
+                        || tail_end_pblock > super_block.block_count()
+                        || self.journal_owns_block_range(tail.start_pblock, tail_end_pblock)
+                    {
+                        transaction.abort();
+                        return_error!(ErrCode::EIO, "Invalid extent tail for inode {}", inode_id);
+                    }
+                    let blocks_per_group = super_block.blocks_per_group() as PBlockId;
+                    let group_remaining = (tail_end_pblock - 1 - first_data_block)
+                        % blocks_per_group
+                        + 1;
+                    let beyond_eof = u64::from(tail_end)
+                        - core::cmp::max(keep_blocks, u64::from(tail.start_lblock));
+                    let remove_limit = u32::try_from(core::cmp::min(beyond_eof, group_remaining))
+                        .map_err(|_| Ext4Error::new(ErrCode::EFBIG))?;
+                    let removed = self
+                        .extent_remove_tail_in_transaction(
+                            &mut transaction,
+                            &mut inode,
+                            remove_limit,
+                        )?
+                        .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                    self.transaction_dealloc_block_range(
+                        &mut transaction,
+                        removed.start_pblock,
+                        removed.block_count,
+                    )?;
+                    for metadata in removed.metadata_blocks.iter().copied() {
+                        self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
+                    }
+                    let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
+                    inode.inode.set_fs_block_count(
+                        inode
+                            .inode
+                            .fs_block_count()
+                            .checked_sub(released)
+                            .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
+                    );
+                    finished = false;
+                }
+            }
+
+            if finished {
+                inode.inode.set_size(new_size);
+            }
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+            if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+                self.poison(ErrCode::EIO);
+                return Err(error.error);
+            }
+            if finished {
+                return Ok(());
+            }
+        }
+    }
+
     /// Link a newly created inode into `parent`.
     ///
     /// If linking fails, this function frees the newly allocated inode to avoid leaks.
@@ -903,8 +1020,33 @@ impl Ext4 {
     ) -> Result<()> {
         // Namespace writers hold `namespace_lock`, so this check and the
         // following insertion are one atomic duplicate-name transaction.
-        if self.dir_find_entry(parent, name).is_ok() {
-            return_error!(ErrCode::EEXIST, "Entry '{}' already exists", name);
+        match self.dir_find_entry(parent, name) {
+            Err(error) if error.code() == ErrCode::ENOENT => {}
+            Ok(_) => {
+                if let Err(cleanup_err) = self.free_inode(child) {
+                    trace!(
+                        "duplicate entry for new inode {} (name {}), cleanup failed: {:?}",
+                        child.id,
+                        name,
+                        cleanup_err
+                    );
+                    return Err(cleanup_err);
+                }
+                return_error!(ErrCode::EEXIST, "Entry '{}' already exists", name);
+            }
+            Err(lookup_err) => {
+                if let Err(cleanup_err) = self.free_inode(child) {
+                    trace!(
+                        "entry lookup failed for new inode {} (name {}), cleanup failed: {:?}; original lookup error: {:?}",
+                        child.id,
+                        name,
+                        cleanup_err,
+                        lookup_err
+                    );
+                    return Err(cleanup_err);
+                }
+                return Err(lookup_err);
+            }
         }
         if let Err(link_err) = self.link_inode(parent, child, name, false) {
             if let Err(cleanup_err) = self.free_inode(child) {
@@ -1359,8 +1501,12 @@ impl Ext4 {
         }
         // `namespace_lock` makes this check atomic with `link_inode`'s
         // directory insertion below.
-        if self.dir_find_entry(&parent, name).is_ok() {
-            return_error!(ErrCode::EEXIST, "Entry '{}' already exists", name);
+        match self.dir_find_entry(&parent, name) {
+            Ok(_) => {
+                return_error!(ErrCode::EEXIST, "Entry already exists");
+            }
+            Err(e) if e.code() == ErrCode::ENOENT => {}
+            Err(e) => return Err(e),
         }
         self.link_inode(&mut parent, &mut child, name, true)?;
         Ok(())
