@@ -901,6 +901,11 @@ impl Ext4 {
         child: &mut InodeRef,
         name: &str,
     ) -> Result<()> {
+        // Namespace writers hold `namespace_lock`, so this check and the
+        // following insertion are one atomic duplicate-name transaction.
+        if self.dir_find_entry(parent, name).is_ok() {
+            return_error!(ErrCode::EEXIST, "Entry '{}' already exists", name);
+        }
         if let Err(link_err) = self.link_inode(parent, child, name, false) {
             if let Err(cleanup_err) = self.free_inode(child) {
                 trace!(
@@ -1351,6 +1356,11 @@ impl Ext4 {
         // Cannot link a directory
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot link a directory");
+        }
+        // `namespace_lock` makes this check atomic with `link_inode`'s
+        // directory insertion below.
+        if self.dir_find_entry(&parent, name).is_ok() {
+            return_error!(ErrCode::EEXIST, "Entry '{}' already exists", name);
         }
         self.link_inode(&mut parent, &mut child, name, true)?;
         Ok(())
