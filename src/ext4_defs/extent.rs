@@ -369,11 +369,7 @@ impl<'a> ExtentNode<'a> {
             i += 1;
         }
 
-        if i == 0 {
-            Err(0)
-        } else {
-            Ok(i - 1)
-        }
+        Ok(i.saturating_sub(1))
     }
 
     pub fn print(&self) {
@@ -681,5 +677,24 @@ mod tests {
         node_mut.init(1, 0);
         let node = ExtentNode::from_bytes(&raw);
         assert_eq!(node.search_extent_index(0), Err(0));
+    }
+
+    #[test]
+    fn search_extent_index_selects_leftmost_child_for_leading_hole() {
+        let mut raw = [0u8; 60];
+        let mut node = ExtentNodeMut::from_bytes(&mut raw);
+        node.init(1, 0);
+        node.insert_extent_index(&ExtentIndex::new(8, 100), 0)
+            .unwrap();
+        node.insert_extent_index(&ExtentIndex::new(16, 200), 1)
+            .unwrap();
+
+        assert_eq!(node.as_immut().search_extent_index(7), Ok(0));
+
+        let mut leaf_raw = [0u8; 60];
+        let mut leaf = ExtentNodeMut::from_bytes(&mut leaf_raw);
+        leaf.init(0, 0);
+        leaf.insert_extent(&Extent::new(8, 100, 1), 0).unwrap();
+        assert_eq!(leaf.as_immut().search_extent(7), Err(0));
     }
 }

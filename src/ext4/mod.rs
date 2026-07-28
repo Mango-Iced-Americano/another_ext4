@@ -924,6 +924,10 @@ impl Ext4 {
     pub(super) fn poison(&self, code: ErrCode) {
         let mut poisoned = self.poisoned.lock();
         if poisoned.is_none() {
+            log::error!(
+                "[ext4] POISON: code={:?} — first poison, all subsequent operations fail-fast",
+                code,
+            );
             *poisoned = Some(code);
         }
     }

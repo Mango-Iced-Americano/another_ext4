@@ -1483,10 +1483,10 @@ impl Ext4 {
     /// * `ENOSPC` - no space left on device
     pub fn link(&self, child: InodeId, parent: InodeId, name: &str) -> Result<()> {
         self.ensure_mutable()?;
-        // Relinking a zero-link inode must compose namespace publication with
-        // orphan removal in one journal transaction.  Use the exclusive
-        // metadata domain for both zero and nonzero link-count cases.
-        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        // link_inode starts its own transaction for zero-link orphan recovery.
+        // The usual direct metadata path may grow the parent directory, whose
+        // allocator acquires the compatible direct mutation domain.
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _namespace_guard = self.namespace_lock.lock();
         let _mutation_guards = self.lock_inode_mutations(&[parent, child]);
         let mut parent = self.read_inode(parent)?;

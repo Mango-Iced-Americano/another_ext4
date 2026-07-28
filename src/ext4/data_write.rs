@@ -73,7 +73,7 @@ impl Ext4 {
                 })?;
             if iblock < start_lblock || iblock >= end_lblock {
                 return Err(format_error!(
-                    ErrCode::EIO,
+                    ErrCode::ENOENT,
                     "non-covering extent for iblock {} on inode {}",
                     iblock,
                     inode_ref.id

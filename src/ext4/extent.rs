@@ -495,7 +495,21 @@ impl Ext4 {
                     inode_ref.inode.extent_root()
                 };
                 let ex = ex_node.extent_at(index);
-                let pblock = ex.start_pblock() + (iblock - ex.start_lblock()) as PBlockId;
+                let start_lblock = ex.start_lblock();
+                let end_lblock = start_lblock
+                    .checked_add(ex.block_count())
+                    .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?;
+                if iblock < start_lblock || iblock >= end_lblock {
+                    return Err(format_error!(
+                        ErrCode::ENOENT,
+                        "extent_query: inode {} iblock {} not covered by extent [{}, {})",
+                        inode_ref.id,
+                        iblock,
+                        start_lblock,
+                        end_lblock
+                    ));
+                }
+                let pblock = ex.start_pblock() + (iblock - start_lblock) as PBlockId;
                 self.ensure_valid_pblock(inode_ref.id, pblock, "extent data block")?;
                 self.validate_data_blocks(pblock, 1)?;
                 Ok(pblock)
