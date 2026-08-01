@@ -128,6 +128,9 @@ pub trait BlockDevice: Send + Sync + Any {
     fn diagnostic_cycles(&self) -> usize {
         0
     }
+
+    /// Record one successfully durable journal transaction in the embedding kernel.
+    fn record_journal_commit(&self, _bytes: usize) {}
 }
 
 #[cfg(test)]

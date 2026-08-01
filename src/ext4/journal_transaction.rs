@@ -857,6 +857,13 @@ impl<'a> Transaction<'a> {
             return self.fail(error, CommitFailure::TailUpdateFailed, true);
         }
 
+        device.record_journal_commit(
+            encoded
+                .len()
+                .saturating_add(1)
+                .saturating_mul(BLOCK_SIZE),
+        );
+
         {
             let mut ctx = core.context.lock();
             ctx.superblock.sequence = next_sequence;

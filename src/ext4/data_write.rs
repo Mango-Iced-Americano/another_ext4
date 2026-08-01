@@ -112,6 +112,28 @@ impl Ext4 {
     /// rather than logical adjacency, determines each block-device write run.
     pub fn write_data_only(&self, file: InodeId, offset: usize, data: &[u8]) -> Result<usize> {
         self.ensure_mutable()?;
+        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        let _mutation_guard =
+            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
+        let file = self.read_inode(file)?;
+        self.write_mapped_data(&file, offset, data)
+    }
+
+    /// Write data through an inode image already protected by a journal transaction.
+    ///
+    /// The caller holds the transactional metadata and inode-mutation guards, so
+    /// this bypasses the direct-mutation barrier that would otherwise commit a
+    /// deferred journal batch before ordinary writeback finishes.
+    pub(super) fn write_journaled_mapped_data(
+        &self,
+        file: &InodeRef,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize> {
+        self.write_mapped_data(file, offset, data)
+    }
+
+    fn write_mapped_data(&self, file: &InodeRef, offset: usize, data: &[u8]) -> Result<usize> {
         let write_size = data.len();
         if write_size == 0 {
             return Ok(0);
@@ -120,10 +142,6 @@ impl Ext4 {
             Some(range) => range,
             None => return Ok(0),
         };
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
-        let _mutation_guard =
-            self.inode_mutation_locks[self.inode_mutation_lock_index(file)].lock();
-        let file = self.read_inode(file)?;
         if !file.inode.is_file() {
             return_error!(ErrCode::EISDIR, "Inode {} is not a file", file.id);
         }

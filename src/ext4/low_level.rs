@@ -18,7 +18,10 @@ macro_rules! println {
     };
 }
 
-const DIRECT_RANGE_MIN_BLOCKS: usize = 4;
+// A page-cache writeback may contain only one dirty page.  Keep it in the
+// transactional append path so consecutive pages extend the same deferred
+// journal batch instead of entering the direct path and forcing a commit.
+const DIRECT_RANGE_MIN_BLOCKS: usize = 1;
 const DIRECT_RANGE_MAX_BLOCKS: usize = 256;
 const DIRECT_RANGE_ZERO_CHUNK_BLOCKS: usize = 8;
 /// Bound the metadata footprint of a writeback batch. Journal-ring pressure
@@ -401,6 +404,60 @@ impl Ext4 {
             Some(_) => DirectRangePrepare::DataWritten,
             None => DirectRangePrepare::Initialized,
         })
+    }
+
+    /// Persist a write to already-mapped blocks without entering the direct
+    /// metadata domain.
+    ///
+    /// A deferred transaction may contain the newest inode/extent image, so
+    /// validate mappings through that image and keep both mutation guards held
+    /// until its data blocks have been written.  This preserves data-before-
+    /// metadata ordering without prematurely committing the deferred batch.
+    fn try_prepare_journal_mapped_write(
+        &self,
+        inode_id: InodeId,
+        range: &WriteLogicalRange,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<DirectRangePrepare> {
+        let mut transaction = self.transaction_start(2)?;
+        let mut inode = self.transaction_read_inode(&transaction, inode_id)?;
+        if inode.inode.mode().bits() == 0 {
+            transaction.abort();
+            return_error!(ErrCode::EINVAL, "Invalid inode {}", inode_id);
+        }
+        for lblock in range.first_lblock..=range.last_lblock {
+            match self.extent_query_with_range(&inode, lblock) {
+                Ok(_) => {}
+                Err(error) if error.code() == ErrCode::ENOENT => {
+                    transaction.abort();
+                    return Ok(DirectRangePrepare::Unsupported);
+                }
+                Err(error) => {
+                    transaction.abort();
+                    return Err(error);
+                }
+            }
+        }
+        self.write_journaled_mapped_data(&inode, offset, data)?;
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
+        if end as u64 > inode.inode.size() {
+            inode.inode.set_size(end as u64);
+            self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+        }
+        if let Err(error) = transaction.defer_or_commit(
+            self.block_device.as_ref(),
+            self,
+            MAX_DEFERRED_JOURNAL_BLOCKS,
+        ) {
+            if error.failure != super::journal_transaction::CommitFailure::BeforeCommit {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error.error);
+        }
+        Ok(DirectRangePrepare::DataWritten)
     }
 
     fn xattr_checksum_seed(&self) -> Result<Option<MetadataChecksumSeed>> {
@@ -798,7 +855,20 @@ impl Ext4 {
             match outcome {
                 DirectRangePrepare::DataWritten => return Ok(true),
                 DirectRangePrepare::Initialized => return Ok(false),
-                DirectRangePrepare::Unsupported => {}
+                DirectRangePrepare::Unsupported => {
+                    if let Some(data) = real_data.and_then(|data| data.get(..len)) {
+                        let outcome = {
+                            let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+                            let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
+                            self.try_prepare_journal_mapped_write(
+                                id, &range, offset, data,
+                            )?
+                        };
+                        if matches!(outcome, DirectRangePrepare::DataWritten) {
+                            return Ok(true);
+                        }
+                    }
+                }
             }
         }
         if self.supports_direct_range_stage() {
