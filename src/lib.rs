@@ -17,5 +17,5 @@ pub use error::{ErrCode, Ext4Error};
 pub use ext4::{Ext4, InodeOwner, PrepareStatsSnapshot, SetAttr};
 pub use ext4_defs::{
     Block, BlockDevice, DirEntry, FileAttr, FileType, Inode, InodeMode, InodeReclaimError,
-    InodeReclaimHandle, InodeRef,
+    InodeReclaimHandle, InodeRef, JournalCommitReason, JournalFlushPhase,
 };

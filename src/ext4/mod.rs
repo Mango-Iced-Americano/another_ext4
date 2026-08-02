@@ -961,7 +961,9 @@ impl Ext4 {
         // Legacy/direct paths cannot observe metadata that exists only in a
         // deferred journal batch. Commit that batch before sharing the direct
         // mutation domain.
-        self.flush_deferred_journal()?;
+        self.flush_deferred_journal_for(
+            crate::ext4_defs::JournalCommitReason::DirectMetadataBarrier,
+        )?;
         self.metadata_mutation_barrier.try_direct()
     }
 

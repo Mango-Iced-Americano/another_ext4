@@ -125,7 +125,8 @@ impl Ext4 {
                             sb.metadata_checksum_seed(),
                             &*bitmap.data,
                             checksum_bytes,
-                        ) {
+                        )
+                    {
                         return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
                     }
                 }
@@ -413,7 +414,8 @@ impl Ext4 {
                         sb.metadata_checksum_seed(),
                         &bitmap_image,
                         checksum_bytes,
-                    ) {
+                    )
+                {
                     return_error!(ErrCode::EIO, "Corrupt block bitmap checksum");
                 }
             }

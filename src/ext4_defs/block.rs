@@ -74,6 +74,34 @@ impl Block {
     }
 }
 
+/// Why a journal transaction reached its commit point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalCommitReason {
+    /// Deferred metadata reached the bounded transaction size.
+    DeferredThreshold,
+    /// A legacy/direct metadata mutation required a stable extent map.
+    DirectMetadataBarrier,
+    /// `fsync`/`sync` requested a durability boundary.
+    DurabilityBoundary,
+    /// Clean unmount is clearing the journal recovery state.
+    Shutdown,
+    /// A non-writeback metadata operation committed synchronously.
+    Explicit,
+}
+
+/// The durable barrier phase inside one JBD2 commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalFlushPhase {
+    /// The active journal superblock and descriptor/data payload are durable.
+    ActiveLog,
+    /// The commit record is durable.
+    CommitRecord,
+    /// Checkpointed home metadata blocks are durable.
+    Checkpoint,
+    /// The clean journal tail update is durable.
+    TailUpdate,
+}
+
 /// Common interface for block devices.
 pub trait BlockDevice: Send + Sync + Any {
     /// Read a block from disk.
@@ -131,6 +159,34 @@ pub trait BlockDevice: Send + Sync + Any {
 
     /// Record one successfully durable journal transaction in the embedding kernel.
     fn record_journal_commit(&self, _bytes: usize) {}
+
+    /// Record successful data-page persistence during writeback.
+    fn record_writeback_data_write(&self, _bytes: usize, _cycles: usize) {}
+
+    /// Record allocation and extent preparation excluding the data write itself.
+    fn record_writeback_alloc_extent(&self, _pages: usize, _cycles: usize) {}
+
+    /// Record a successful journal transaction with its durable reason.
+    fn record_writeback_journal_commit(
+        &self,
+        _transaction_id: u32,
+        _staged_blocks: usize,
+        _cycles: usize,
+        _reason: JournalCommitReason,
+    ) {
+    }
+
+    /// Record one successful durable barrier of a journal transaction.
+    fn record_writeback_journal_flush(
+        &self,
+        _transaction_id: u32,
+        _phase: JournalFlushPhase,
+        _cycles: usize,
+    ) {
+    }
+
+    /// Record a raw durability-boundary flush outside a journal transaction.
+    fn record_writeback_flush_boundary(&self, _reason: JournalCommitReason, _cycles: usize) {}
 }
 
 #[cfg(test)]

@@ -73,6 +73,44 @@ impl SetAttr {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn is_writeback_metadata_only(&self) -> bool {
+        self.mode.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && (self.size.is_some()
+                || self.atime.is_some()
+                || self.mtime.is_some()
+                || self.ctime.is_some()
+                || self.crtime.is_some())
+    }
+
+    fn apply_to(&self, inode: &mut Inode) {
+        if let Some(mode) = self.mode {
+            inode.set_mode(mode);
+        }
+        if let Some(uid) = self.uid {
+            inode.set_uid(uid);
+        }
+        if let Some(gid) = self.gid {
+            inode.set_gid(gid);
+        }
+        if let Some(size) = self.size {
+            inode.set_size(size);
+        }
+        if let Some(atime) = self.atime {
+            inode.set_atime(atime);
+        }
+        if let Some(mtime) = self.mtime {
+            inode.set_mtime(mtime);
+        }
+        if let Some(ctime) = self.ctime {
+            inode.set_ctime(ctime);
+        }
+        if let Some(crtime) = self.crtime {
+            inode.set_crtime(crtime);
+        }
+    }
 }
 
 impl Ext4 {
@@ -261,11 +299,11 @@ impl Ext4 {
         self.prepare_stats.record_inode_io();
         match real_data {
             Some(_) => {
-        // [ext4_diag] direct_ok:data_written — commented out
+                // [ext4_diag] direct_ok:data_written — commented out
                 Ok(DirectRangePrepare::DataWritten)
             }
             None => {
-        // [ext4_diag] direct_ok:initialized — commented out
+                // [ext4_diag] direct_ok:initialized — commented out
                 Ok(DirectRangePrepare::Initialized)
             }
         }
@@ -283,6 +321,12 @@ impl Ext4 {
         range: &WriteLogicalRange,
         real_data: Option<&[u8]>,
     ) -> Result<DirectRangePrepare> {
+        let diagnostic = self.block_device.diagnostic_enabled();
+        let prepare_start = if diagnostic {
+            self.block_device.diagnostic_cycles()
+        } else {
+            0
+        };
         // Read through the active transaction so consecutive deferred batches
         // extend the latest staged inode image instead of overwriting it.
         let mut transaction = self.transaction_start(4)?;
@@ -348,6 +392,11 @@ impl Ext4 {
         self.prepare_stats.record_requested(plan.count as usize);
         self.prepare_stats
             .record_missing_blocks(plan.count as usize);
+        let data_start = if diagnostic {
+            self.block_device.diagnostic_cycles()
+        } else {
+            0
+        };
         let initialized = match real_data {
             Some(data) => self.write_direct_range_data(allocation.first, plan.count as usize, data),
             None => self.initialize_direct_range(
@@ -358,6 +407,13 @@ impl Ext4 {
                     .ok_or_else(|| Ext4Error::new(ErrCode::EIO))?,
             ),
         };
+        let data_cycles = if diagnostic {
+            self.block_device
+                .diagnostic_cycles()
+                .wrapping_sub(data_start)
+        } else {
+            0
+        };
         if let Err(error) = initialized {
             self.prepare_stats.record_failure();
             transaction.abort();
@@ -367,14 +423,12 @@ impl Ext4 {
             return Err(error);
         }
 
-        if let Err(error) =
-            self.stage_direct_append_extent(
-                &mut inode,
-                plan.start_lblock,
-                allocation.first,
-                plan.count,
-            )
-        {
+        if let Err(error) = self.stage_direct_append_extent(
+            &mut inode,
+            plan.start_lblock,
+            allocation.first,
+            plan.count,
+        ) {
             self.prepare_stats.record_failure();
             transaction.abort();
             return Err(error);
@@ -400,6 +454,18 @@ impl Ext4 {
         self.prepare_stats.record_gdt_io();
         self.prepare_stats.record_superblock_io();
         self.prepare_stats.record_inode_io();
+        if diagnostic {
+            let prepare_cycles = self
+                .block_device
+                .diagnostic_cycles()
+                .wrapping_sub(prepare_start);
+            self.block_device
+                .record_writeback_data_write(total, data_cycles);
+            self.block_device.record_writeback_alloc_extent(
+                plan.count as usize,
+                prepare_cycles.saturating_sub(data_cycles),
+            );
+        }
         Ok(match real_data {
             Some(_) => DirectRangePrepare::DataWritten,
             None => DirectRangePrepare::Initialized,
@@ -420,6 +486,12 @@ impl Ext4 {
         offset: usize,
         data: &[u8],
     ) -> Result<DirectRangePrepare> {
+        let diagnostic = self.block_device.diagnostic_enabled();
+        let prepare_start = if diagnostic {
+            self.block_device.diagnostic_cycles()
+        } else {
+            0
+        };
         let mut transaction = self.transaction_start(2)?;
         let mut inode = self.transaction_read_inode(&transaction, inode_id)?;
         if inode.inode.mode().bits() == 0 {
@@ -439,7 +511,19 @@ impl Ext4 {
                 }
             }
         }
-        self.write_journaled_mapped_data(&inode, offset, data)?;
+        let data_start = if diagnostic {
+            self.block_device.diagnostic_cycles()
+        } else {
+            0
+        };
+        let data_written = self.write_journaled_mapped_data(&inode, offset, data)?;
+        let data_cycles = if diagnostic {
+            self.block_device
+                .diagnostic_cycles()
+                .wrapping_sub(data_start)
+        } else {
+            0
+        };
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| Ext4Error::new(ErrCode::EFBIG))?;
@@ -456,6 +540,18 @@ impl Ext4 {
                 self.poison(ErrCode::EIO);
             }
             return Err(error.error);
+        }
+        if diagnostic {
+            let prepare_cycles = self
+                .block_device
+                .diagnostic_cycles()
+                .wrapping_sub(prepare_start);
+            self.block_device
+                .record_writeback_data_write(data_written, data_cycles);
+            self.block_device.record_writeback_alloc_extent(
+                range.block_count as usize,
+                prepare_cycles.saturating_sub(data_cycles),
+            );
         }
         Ok(DirectRangePrepare::DataWritten)
     }
@@ -597,36 +693,18 @@ impl Ext4 {
     /// `EINVAL` if the inode is invalid (mode == 0).
     pub fn setattr(&self, id: InodeId, attr: SetAttr) -> Result<()> {
         self.ensure_mutable()?;
+        if attr.is_writeback_metadata_only()
+            && self.defer_inode_metadata_if_pending(id, |inode| attr.apply_to(&mut inode.inode))?
+        {
+            return Ok(());
+        }
         let _metadata_guard = self.lock_direct_metadata_mutation()?;
         let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
         let mut inode = self.read_inode(id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
-        if let Some(mode) = attr.mode {
-            inode.inode.set_mode(mode);
-        }
-        if let Some(uid) = attr.uid {
-            inode.inode.set_uid(uid);
-        }
-        if let Some(gid) = attr.gid {
-            inode.inode.set_gid(gid);
-        }
-        if let Some(size) = attr.size {
-            inode.inode.set_size(size);
-        }
-        if let Some(atime) = attr.atime {
-            inode.inode.set_atime(atime);
-        }
-        if let Some(mtime) = attr.mtime {
-            inode.inode.set_mtime(mtime);
-        }
-        if let Some(ctime) = attr.ctime {
-            inode.inode.set_ctime(ctime);
-        }
-        if let Some(crtime) = attr.crtime {
-            inode.inode.set_crtime(crtime);
-        }
+        attr.apply_to(&mut inode.inode);
         self.write_inode_with_csum(&mut inode)?;
         Ok(())
     }
@@ -696,11 +774,8 @@ impl Ext4 {
                 // Allocate and initialize all missing data before the one-per-
                 // group bitmap/GDT/superblock publish.  Extents are installed
                 // only after that metadata is durable.
-                let allocated = self.alloc_zeroed_data_blocks(
-                    inode,
-                    missing_lblocks.len(),
-                    skip_zero,
-                )?;
+                let allocated =
+                    self.alloc_zeroed_data_blocks(inode, missing_lblocks.len(), skip_zero)?;
                 let mut allocation_index = 0usize;
                 while allocation_index < allocated.len() {
                     let first_lblock = missing_lblocks[allocation_index];
@@ -860,9 +935,7 @@ impl Ext4 {
                         let outcome = {
                             let _metadata_guard = self.lock_transactional_metadata_mutation()?;
                             let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
-                            self.try_prepare_journal_mapped_write(
-                                id, &range, offset, data,
-                            )?
+                            self.try_prepare_journal_mapped_write(id, &range, offset, data)?
                         };
                         if matches!(outcome, DirectRangePrepare::DataWritten) {
                             return Ok(true);
@@ -934,24 +1007,51 @@ impl Ext4 {
         atime: Option<u32>,
         mtime: Option<u32>,
     ) -> Result<()> {
-        self.ensure_mutable()?;
-        let _metadata_guard = self.lock_direct_metadata_mutation()?;
+        self.setattr(
+            id,
+            SetAttr {
+                size,
+                atime,
+                mtime,
+                ..SetAttr::default()
+            },
+        )
+    }
+
+    /// Extends an active writeback journal batch with one inode image.
+    ///
+    /// The transactional gate excludes direct writers while the pending batch
+    /// is taken and restaged.  Callers fall back to their direct path when no
+    /// deferred batch exists, preserving legacy metadata semantics.
+    fn defer_inode_metadata_if_pending<F>(&self, id: InodeId, update: F) -> Result<bool>
+    where
+        F: FnOnce(&mut InodeRef),
+    {
+        if !self.uses_journal() {
+            return Ok(false);
+        }
+        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        let Some(mut transaction) = self.transaction_start_if_deferred(1)? else {
+            return Ok(false);
+        };
         let _mutation_guard = self.lock_inode_mutation_for_prepare(id);
-        let mut inode = self.read_inode(id)?;
+        let mut inode = self.transaction_read_inode(&transaction, id)?;
         if inode.inode.mode().bits() == 0 {
             return_error!(ErrCode::EINVAL, "Invalid inode {}", id);
         }
-        if let Some(size) = size {
-            inode.inode.set_size(size);
+        update(&mut inode);
+        self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
+        if let Err(error) = transaction.defer_or_commit(
+            self.block_device.as_ref(),
+            self,
+            MAX_DEFERRED_JOURNAL_BLOCKS,
+        ) {
+            if error.failure != super::journal_transaction::CommitFailure::BeforeCommit {
+                self.poison(ErrCode::EIO);
+            }
+            return Err(error.error);
         }
-        if let Some(atime) = atime {
-            inode.inode.set_atime(atime);
-        }
-        if let Some(mtime) = mtime {
-            inode.inode.set_mtime(mtime);
-        }
-        self.write_inode_with_csum(&mut inode)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Commit the file size (`i_size`) and optionally `mtime` to disk,
@@ -1031,9 +1131,8 @@ impl Ext4 {
                         return_error!(ErrCode::EIO, "Invalid extent tail for inode {}", inode_id);
                     }
                     let blocks_per_group = super_block.blocks_per_group() as PBlockId;
-                    let group_remaining = (tail_end_pblock - 1 - first_data_block)
-                        % blocks_per_group
-                        + 1;
+                    let group_remaining =
+                        (tail_end_pblock - 1 - first_data_block) % blocks_per_group + 1;
                     let beyond_eof = u64::from(tail_end)
                         - core::cmp::max(keep_blocks, u64::from(tail.start_lblock));
                     let remove_limit = u32::try_from(core::cmp::min(beyond_eof, group_remaining))
@@ -1053,7 +1152,8 @@ impl Ext4 {
                     for metadata in removed.metadata_blocks.iter().copied() {
                         self.transaction_dealloc_block_range(&mut transaction, metadata, 1)?;
                     }
-                    let released = removed.block_count as u64 + removed.metadata_blocks.len() as u64;
+                    let released =
+                        removed.block_count as u64 + removed.metadata_blocks.len() as u64;
                     inode.inode.set_fs_block_count(
                         inode
                             .inode
@@ -2509,7 +2609,9 @@ mod tests {
             inode_mutation_locks: (0..crate::ext4::INODE_MUTATION_LOCK_SHARDS)
                 .map(|_| spin::Mutex::new(()))
                 .collect(),
-            prepared_extents: spin::Mutex::new(crate::ext4::prepared_extent::PreparedExtentCache::new()),
+            prepared_extents: spin::Mutex::new(
+                crate::ext4::prepared_extent::PreparedExtentCache::new(),
+            ),
             prepare_stats: crate::ext4::PrepareStats::new(),
         }
     }

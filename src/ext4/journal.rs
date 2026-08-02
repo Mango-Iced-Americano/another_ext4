@@ -1,6 +1,6 @@
 use super::{journal_recovery, journal_transaction, Ext4, MetadataMutationMode};
 use crate::constants::BLOCK_SIZE;
-use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, SuperBlock};
+use crate::ext4_defs::{AsBytes, Block, BlockDevice, InodeRef, JournalCommitReason, SuperBlock};
 use crate::jbd2::Superblock as JournalSuperblock;
 use crate::prelude::*;
 
@@ -119,17 +119,21 @@ impl Ext4 {
 
     pub fn flush_device(&self) -> Result<()> {
         if matches!(self.metadata_mode, MetadataMutationMode::Journal(_)) {
-            self.flush_deferred_journal()?;
+            self.flush_deferred_journal_for(JournalCommitReason::DurabilityBoundary)?;
         }
-        self.block_device.flush()
+        self.flush_device_boundary(JournalCommitReason::DurabilityBoundary)
     }
 
     /// Commit pending writeback metadata before a durability boundary.
     pub fn flush_deferred_journal(&self) -> Result<()> {
+        self.flush_deferred_journal_for(JournalCommitReason::Explicit)
+    }
+
+    pub(super) fn flush_deferred_journal_for(&self, reason: JournalCommitReason) -> Result<()> {
         let MetadataMutationMode::Journal(core) = &self.metadata_mode else {
             return Ok(());
         };
-        match core.flush_deferred_transaction(self.block_device.as_ref(), self) {
+        match core.flush_deferred_transaction(self.block_device.as_ref(), self, reason) {
             Ok(_) => Ok(()),
             Err(error) => {
                 if error.failure != journal_transaction::CommitFailure::BeforeCommit {
@@ -138,6 +142,23 @@ impl Ext4 {
                 Err(error.error)
             }
         }
+    }
+
+    fn flush_device_boundary(&self, reason: JournalCommitReason) -> Result<()> {
+        let diagnostic = self.block_device.diagnostic_enabled();
+        let start = if diagnostic {
+            self.block_device.diagnostic_cycles()
+        } else {
+            0
+        };
+        self.block_device.flush()?;
+        if diagnostic {
+            self.block_device.record_writeback_flush_boundary(
+                reason,
+                self.block_device.diagnostic_cycles().wrapping_sub(start),
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn initialize_direct(&mut self) -> Result<()> {
@@ -185,14 +206,14 @@ impl Ext4 {
                     return Err(Ext4Error::new(ErrCode::EIO));
                 }
                 if self.write_barrier {
-                    self.block_device.flush()?;
+                    self.flush_device_boundary(JournalCommitReason::Shutdown)?;
                 }
                 if self.direct_restore_clean {
                     let mut sb = self.read_super_block_cached();
                     sb.set_clean(true);
                     self.write_super_block(&sb)?;
                     if self.write_barrier {
-                        self.block_device.flush()?;
+                        self.flush_device_boundary(JournalCommitReason::Shutdown)?;
                     }
                 }
                 return Ok(());
@@ -202,7 +223,7 @@ impl Ext4 {
         if journal.is_poisoned() {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
-        self.flush_deferred_journal()?;
+        self.flush_deferred_journal_for(JournalCommitReason::Shutdown)?;
         if !journal.can_shutdown() {
             return Err(Ext4Error::new(ErrCode::EIO));
         }
@@ -212,7 +233,7 @@ impl Ext4 {
         let mut sb = self.read_super_block_cached();
         sb.set_incompatible_feature(SuperBlock::FEATURE_INCOMPAT_RECOVER, false);
         self.write_super_block(&sb)?;
-        self.block_device.flush()
+        self.flush_device_boundary(JournalCommitReason::Shutdown)
     }
 
     #[allow(dead_code)]
@@ -224,6 +245,19 @@ impl Ext4 {
             MetadataMutationMode::ReadOnly => Err(Ext4Error::new(ErrCode::EROFS)),
             MetadataMutationMode::Journal(core) => core.start(credits),
             MetadataMutationMode::Direct(core) => core.start(credits),
+        }
+    }
+
+    /// Starts a journal transaction only to extend an already deferred batch.
+    /// Direct and empty-journal cases intentionally return `None` so callers
+    /// retain their established synchronous metadata behavior.
+    pub(super) fn transaction_start_if_deferred(
+        &self,
+        credits: usize,
+    ) -> Result<Option<journal_transaction::Transaction<'_>>> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.start_if_deferred(credits),
+            MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => Ok(None),
         }
     }
 

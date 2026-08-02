@@ -7,7 +7,7 @@
 #![allow(dead_code)] // Activated only after every production metadata writer uses handles.
 
 use crate::constants::BLOCK_SIZE;
-use crate::ext4_defs::{Block, BlockDevice};
+use crate::ext4_defs::{Block, BlockDevice, JournalCommitReason, JournalFlushPhase};
 use crate::jbd2::{
     block_checksum, checksum_seed, commit_checksum, tag_checksum, BlockType, ChecksumMode,
     Features, Header, Superblock, BLOCK_TAIL_BYTES, CRC32C_CHKSUM, FLAG_ESCAPE, FLAG_LAST_TAG,
@@ -221,6 +221,65 @@ impl JournalTransactionCore {
         self.context.lock().deferred_transaction.is_some()
     }
 
+    /// Start a transaction only when it can extend an existing deferred batch.
+    ///
+    /// A caller that receives `None` must preserve its normal direct-metadata
+    /// behavior.  The writer token makes the pending-batch decision atomic with
+    /// taking its staged images, so a durability boundary cannot split the
+    /// metadata update from the batch it extends.
+    pub(super) fn start_if_deferred(&self, credits: usize) -> Result<Option<Transaction<'_>>> {
+        if credits == 0 || self.is_poisoned() {
+            return Err(Ext4Error::new(if credits == 0 {
+                ErrCode::EINVAL
+            } else {
+                ErrCode::EROFS
+            }));
+        }
+        if self
+            .writer
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(Ext4Error::new(ErrCode::EAGAIN));
+        }
+
+        let deferred_staged = {
+            let mut context = self.context.lock();
+            let Some(deferred) = context.deferred_transaction.as_ref() else {
+                self.writer.store(false, Ordering::Release);
+                return Ok(None);
+            };
+            let total = match deferred.staged.len().checked_add(credits) {
+                Some(total) => total,
+                None => {
+                    self.writer.store(false, Ordering::Release);
+                    return Err(Ext4Error::new(ErrCode::E2BIG));
+                }
+            };
+            let fits =
+                match required_log_blocks(total, context.superblock.features).and_then(|needed| {
+                    ring_len(&context.superblock).map(|available| needed <= available)
+                }) {
+                    Ok(fits) => fits,
+                    Err(error) => {
+                        self.writer.store(false, Ordering::Release);
+                        return Err(error);
+                    }
+                };
+            if !fits {
+                self.writer.store(false, Ordering::Release);
+                return Err(Ext4Error::new(ErrCode::E2BIG));
+            }
+            context.deferred_transaction.take()
+        };
+        Ok(Some(Transaction::new(
+            TransactionCoreRef::Journal(self),
+            credits,
+            false,
+            deferred_staged,
+        )))
+    }
+
     pub fn owns_block_range(&self, start: PBlockId, end: PBlockId) -> bool {
         start < end
             && self
@@ -287,6 +346,7 @@ impl JournalTransactionCore {
         &self,
         device: &dyn BlockDevice,
         publisher: &dyn CachePublisher,
+        reason: JournalCommitReason,
     ) -> core::result::Result<bool, CommitError> {
         if self
             .writer
@@ -304,7 +364,7 @@ impl JournalTransactionCore {
             return Ok(false);
         };
         let transaction = Transaction::from_deferred(self, deferred);
-        transaction.commit_journal(device, publisher)?;
+        transaction.commit_journal(device, publisher, reason)?;
         Ok(true)
     }
 
@@ -519,6 +579,10 @@ impl<'a> Transaction<'a> {
             return self.commit(device, publisher);
         };
         let total = self.total_staged_len();
+        if total == 0 {
+            self.release_writer();
+            return Ok(());
+        }
         let must_commit = {
             let context = core.context.lock();
             let required =
@@ -535,7 +599,7 @@ impl<'a> Transaction<'a> {
             total >= max_deferred_blocks || required.saturating_mul(2) >= available
         };
         if must_commit {
-            return self.commit_journal(device, publisher);
+            return self.commit_journal(device, publisher, JournalCommitReason::DeferredThreshold);
         }
 
         self.absorb_deferred_staged();
@@ -561,7 +625,9 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
         match self.core {
-            TransactionCoreRef::Journal(_) => self.commit_journal(device, publisher),
+            TransactionCoreRef::Journal(_) => {
+                self.commit_journal(device, publisher, JournalCommitReason::Explicit)
+            }
             TransactionCoreRef::Direct(_) => self.commit_direct(device, publisher),
         }
     }
@@ -701,6 +767,7 @@ impl<'a> Transaction<'a> {
         mut self,
         device: &dyn BlockDevice,
         publisher: &dyn CachePublisher,
+        reason: JournalCommitReason,
     ) -> core::result::Result<(), CommitError> {
         self.absorb_deferred_staged();
         let TransactionCoreRef::Journal(core) = self.core else {
@@ -745,6 +812,12 @@ impl<'a> Transaction<'a> {
         }
 
         let sequence = sb.sequence;
+        let diagnostic = device.diagnostic_enabled();
+        let commit_start = if diagnostic {
+            device.diagnostic_cycles()
+        } else {
+            0
+        };
         let positions = ring_positions(&sb, head, needed).map_err(|error| CommitError {
             error,
             failure: CommitFailure::BeforeCommit,
@@ -827,7 +900,9 @@ impl<'a> Transaction<'a> {
             run_start = run_end;
         }
         // Single barrier for active-SB + payload (was two separate flushes)
-        if let Err(error) = device.flush() {
+        if let Err(error) =
+            flush_journal_phase(device, sequence, JournalFlushPhase::ActiveLog, diagnostic)
+        {
             return self.fail(error, CommitFailure::BeforeCommit, true);
         }
 
@@ -835,7 +910,12 @@ impl<'a> Transaction<'a> {
         if let Err(error) = write_bytes(device, mapping[commit_logical as usize], &commit) {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
-        if let Err(error) = device.flush() {
+        if let Err(error) = flush_journal_phase(
+            device,
+            sequence,
+            JournalFlushPhase::CommitRecord,
+            diagnostic,
+        ) {
             return self.fail(error, CommitFailure::CommitUncertain, true);
         }
 
@@ -844,7 +924,9 @@ impl<'a> Transaction<'a> {
                 return self.fail(error, CommitFailure::CheckpointFailed, true);
             }
         }
-        if let Err(error) = device.flush() {
+        if let Err(error) =
+            flush_journal_phase(device, sequence, JournalFlushPhase::Checkpoint, diagnostic)
+        {
             return self.fail(error, CommitFailure::CheckpointFailed, true);
         }
 
@@ -853,16 +935,21 @@ impl<'a> Transaction<'a> {
         if let Err(error) = write_journal_superblock(device, &mapping, &clean_sb_image) {
             return self.fail(error, CommitFailure::TailUpdateFailed, true);
         }
-        if let Err(error) = device.flush() {
+        if let Err(error) =
+            flush_journal_phase(device, sequence, JournalFlushPhase::TailUpdate, diagnostic)
+        {
             return self.fail(error, CommitFailure::TailUpdateFailed, true);
         }
 
-        device.record_journal_commit(
-            encoded
-                .len()
-                .saturating_add(1)
-                .saturating_mul(BLOCK_SIZE),
-        );
+        device.record_journal_commit(encoded.len().saturating_add(1).saturating_mul(BLOCK_SIZE));
+        if diagnostic {
+            device.record_writeback_journal_commit(
+                sequence,
+                self.staged.len(),
+                device.diagnostic_cycles().wrapping_sub(commit_start),
+                reason,
+            );
+        }
 
         {
             let mut ctx = core.context.lock();
@@ -1097,6 +1184,28 @@ fn write_bytes(device: &dyn BlockDevice, id: PBlockId, bytes: &[u8; BLOCK_SIZE])
     device.write_block(&Block::new(id, Box::new(*bytes)))
 }
 
+fn flush_journal_phase(
+    device: &dyn BlockDevice,
+    transaction_id: u32,
+    phase: JournalFlushPhase,
+    diagnostic: bool,
+) -> Result<()> {
+    let start = if diagnostic {
+        device.diagnostic_cycles()
+    } else {
+        0
+    };
+    device.flush()?;
+    if diagnostic {
+        device.record_writeback_journal_flush(
+            transaction_id,
+            phase,
+            device.diagnostic_cycles().wrapping_sub(start),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1224,8 @@ mod tests {
         reads: AtomicUsize,
         writes: AtomicUsize,
         flushes: AtomicUsize,
+        journal_commits: spin::Mutex<Vec<(u32, usize, JournalCommitReason)>>,
+        journal_flushes: spin::Mutex<Vec<(u32, JournalFlushPhase)>>,
     }
 
     impl MemoryDevice {
@@ -1129,6 +1240,8 @@ mod tests {
                 reads: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
                 flushes: AtomicUsize::new(0),
+                journal_commits: spin::Mutex::new(Vec::new()),
+                journal_flushes: spin::Mutex::new(Vec::new()),
             }
         }
 
@@ -1183,6 +1296,35 @@ mod tests {
 
         fn supports_reliable_flush(&self) -> bool {
             true
+        }
+
+        fn diagnostic_enabled(&self) -> bool {
+            true
+        }
+
+        fn diagnostic_cycles(&self) -> usize {
+            self.operation.load(Ordering::SeqCst)
+        }
+
+        fn record_writeback_journal_commit(
+            &self,
+            transaction_id: u32,
+            staged_blocks: usize,
+            _cycles: usize,
+            reason: JournalCommitReason,
+        ) {
+            self.journal_commits
+                .lock()
+                .push((transaction_id, staged_blocks, reason));
+        }
+
+        fn record_writeback_journal_flush(
+            &self,
+            transaction_id: u32,
+            phase: JournalFlushPhase,
+            _cycles: usize,
+        ) {
+            self.journal_flushes.lock().push((transaction_id, phase));
         }
     }
 
@@ -1584,6 +1726,31 @@ mod tests {
     }
 
     #[test]
+    fn journal_commit_records_transaction_reason_and_four_barriers() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context()).unwrap();
+        let mut transaction = core.start(1).unwrap();
+        transaction.stage(42, Box::new([0x33; BLOCK_SIZE])).unwrap();
+
+        transaction.commit(&device, &publisher).unwrap();
+
+        assert_eq!(
+            &*device.journal_commits.lock(),
+            &[(7, 1, JournalCommitReason::Explicit)]
+        );
+        assert_eq!(
+            &*device.journal_flushes.lock(),
+            &[
+                (7, JournalFlushPhase::ActiveLog),
+                (7, JournalFlushPhase::CommitRecord),
+                (7, JournalFlushPhase::Checkpoint),
+                (7, JournalFlushPhase::TailUpdate),
+            ]
+        );
+    }
+
+    #[test]
     fn deferred_writeback_batches_share_one_journal_commit() {
         let device = MemoryDevice::new();
         let publisher = Publisher(AtomicUsize::new(0));
@@ -1608,11 +1775,152 @@ mod tests {
         assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
 
         assert!(core
-            .flush_deferred_transaction(&device, &publisher)
+            .flush_deferred_transaction(
+                &device,
+                &publisher,
+                JournalCommitReason::DurabilityBoundary,
+            )
             .unwrap());
         assert_eq!(device.flushes.load(Ordering::SeqCst), 4);
         assert_eq!(publisher.0.load(Ordering::SeqCst), 2);
         assert!(!core.has_pending_transaction());
+    }
+
+    #[test]
+    fn deferred_metadata_joins_pending_writeback_until_durability_boundary() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context_with_ring(
+            TEST_LARGE_JOURNAL_BLOCKS,
+            TEST_LARGE_JOURNAL_BLOCKS - 1,
+        ))
+        .unwrap();
+
+        // Given data has reached the device before its extent metadata is staged.
+        device
+            .write_block(&Block::new(50, Box::new([0xD0; BLOCK_SIZE])))
+            .unwrap();
+        let mut writeback = core.start(1).unwrap();
+        writeback.stage(43, Box::new([0xE1; BLOCK_SIZE])).unwrap();
+        writeback
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        // When the inode size/timestamp image is prepared for the same batch.
+        let mut metadata = core
+            .start_if_deferred(1)
+            .unwrap()
+            .expect("pending writeback must accept compatible metadata");
+        metadata.stage(42, Box::new([0xC2; BLOCK_SIZE])).unwrap();
+        metadata
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        // Then no DirectMetadataBarrier commit occurs before the sync boundary.
+        assert!(core.has_pending_transaction());
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        assert!(device.journal_commits.lock().is_empty());
+
+        assert!(core
+            .flush_deferred_transaction(
+                &device,
+                &publisher,
+                JournalCommitReason::DurabilityBoundary,
+            )
+            .unwrap());
+
+        let journal_commits = device.journal_commits.lock();
+        assert_eq!(journal_commits.len(), 1);
+        assert_eq!(journal_commits[0].1, 2);
+        assert_eq!(
+            journal_commits[0].2,
+            JournalCommitReason::DurabilityBoundary
+        );
+        let transaction_id = journal_commits[0].0;
+        drop(journal_commits);
+        assert_eq!(
+            &*device.journal_flushes.lock(),
+            &[
+                (transaction_id, JournalFlushPhase::ActiveLog),
+                (transaction_id, JournalFlushPhase::CommitRecord),
+                (transaction_id, JournalFlushPhase::Checkpoint),
+                (transaction_id, JournalFlushPhase::TailUpdate),
+            ]
+        );
+        let write_order = device.write_order.lock();
+        let data_index = write_order
+            .iter()
+            .position(|block| *block == 50)
+            .expect("data write must be recorded");
+        let metadata_index = write_order
+            .iter()
+            .position(|block| *block == 42)
+            .expect("metadata checkpoint must be recorded");
+        assert!(data_index < metadata_index);
+        device.crash();
+        assert_eq!(
+            device.stable_block(50).unwrap().as_slice(),
+            &[0xD0; BLOCK_SIZE]
+        );
+        assert_eq!(
+            device.stable_block(42).unwrap().as_slice(),
+            &[0xC2; BLOCK_SIZE]
+        );
+        assert_eq!(
+            device.stable_block(43).unwrap().as_slice(),
+            &[0xE1; BLOCK_SIZE]
+        );
+    }
+
+    #[test]
+    fn metadata_without_pending_writeback_keeps_direct_path_available() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context()).unwrap();
+
+        // Given no deferred writeback metadata exists.
+        assert!(core.start_if_deferred(1).unwrap().is_none());
+
+        // When the caller falls back to its normal direct metadata path.
+        let mut direct = core.start(1).unwrap();
+        direct.stage(42, Box::new([0xD1; BLOCK_SIZE])).unwrap();
+        direct.commit(&device, &publisher).unwrap();
+
+        // Then it still commits normally with the complete JBD2 barrier set.
+        assert_eq!(
+            &*device.journal_commits.lock(),
+            &[(7, 1, JournalCommitReason::Explicit)]
+        );
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn empty_deferred_writeback_never_creates_a_metadata_barrier_commit() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context()).unwrap();
+
+        // Given a writeback preparation that did not change any journal home.
+        core.start(1)
+            .unwrap()
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        // When a later metadata operation reaches its durability boundary.
+        let committed = core
+            .flush_deferred_transaction(
+                &device,
+                &publisher,
+                JournalCommitReason::DirectMetadataBarrier,
+            )
+            .unwrap();
+
+        // Then the empty batch cannot manufacture a four-phase journal commit.
+        assert!(!committed);
+        assert!(!core.has_pending_transaction());
+        assert_eq!(device.flushes.load(Ordering::SeqCst), 0);
+        assert!(device.journal_commits.lock().is_empty());
+        assert!(device.journal_flushes.lock().is_empty());
     }
 
     #[test]
