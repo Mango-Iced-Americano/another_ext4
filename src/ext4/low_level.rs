@@ -1697,6 +1697,12 @@ impl Ext4 {
     pub fn unlink(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        // Namespace deletion may follow a dirty page-cache writeback batch.
+        // Flush that deferred journal image before reserving the unlink
+        // transaction; otherwise the pending images are counted against the
+        // small unlink credit budget and a valid remove can spuriously return
+        // E2BIG when the journal ring is nearly full.
+        self.flush_deferred_journal()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut parent_ref = self.read_inode(parent)?;
         // Can only unlink from a directory
@@ -1814,6 +1820,10 @@ impl Ext4 {
         // transactional orphan/reclaim implementation cannot inherit a stale
         // direct-writer snapshot window.
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        // The rename transaction has a bounded credit estimate.  Do not let
+        // an unrelated deferred writeback batch consume that reservation and
+        // turn a normal namespace update into E2BIG.
+        self.flush_deferred_journal()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut reclaim = None;
         // 1. 验证父目录
@@ -2299,6 +2309,9 @@ impl Ext4 {
     pub fn rmdir(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
+        // See unlink(): rmdir also stages a final-link orphan transaction and
+        // must start from an empty deferred journal batch.
+        self.flush_deferred_journal()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut parent_ref = self.read_inode(parent)?;
         // Can only remove a directory in a directory
