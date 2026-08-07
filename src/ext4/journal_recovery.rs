@@ -291,7 +291,13 @@ fn parse_tags(block: &[u8], sb: &Superblock, target_blocks: u64) -> Result<Vec<T
             (flags, high, None)
         };
         off += size;
-        if flags & FLAG_SAME_UUID == 0 {
+        // JBD2 checksum-v3 descriptor tags have no inline UUID.  The UUID
+        // extension belongs only to legacy (checksum-none) tags; treating
+        // csum-v3 bytes as a UUID shifts the following tag and returns EIO on
+        // valid Linux journals.
+        if matches!(sb.features.checksum, ChecksumMode::None)
+            && flags & FLAG_SAME_UUID == 0
+        {
             let uuid = block.get(off..off + 16).ok_or_else(eio)?;
             if uuid != sb.uuid {
                 return Err(Ext4Error::new(ErrCode::EIO));

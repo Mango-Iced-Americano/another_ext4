@@ -271,7 +271,14 @@ impl<'a> DescriptorTags<'a> {
             return malformed("unknown JBD2 descriptor tag flag");
         }
         self.offset = tag_end;
-        if flags & FLAG_SAME_UUID == 0 {
+        // Legacy JBD2 tags (without a checksum feature) may carry an inline
+        // journal UUID when SAME_UUID is clear.  Checksum-v2/v3 tags do not
+        // carry that UUID field; their fixed-width tag already contains the
+        // checksum/high-block words.  Consuming 16 extra bytes for csum-v3
+        // shifts the next tag and rejects valid Linux journals as EIO.
+        if matches!(self.features.checksum, ChecksumMode::None)
+            && flags & FLAG_SAME_UUID == 0
+        {
             self.offset = self.offset.checked_add(16).ok_or_else(eio)?;
             if self.offset > self.end {
                 return malformed("truncated JBD2 descriptor UUID");
