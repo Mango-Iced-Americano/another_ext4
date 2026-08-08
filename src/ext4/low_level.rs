@@ -2790,6 +2790,34 @@ mod tests {
     }
 
     #[test]
+    fn metadata_mutation_barrier_notifies_only_after_guard_release() {
+        struct Counter(Arc<AtomicUsize>);
+
+        impl crate::MetadataMutationNotifier for Counter {
+            fn notify(&self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        let fs = make_test_fs(16);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        fs.set_metadata_mutation_notifier(Arc::new(Counter(notifications.clone())));
+
+        let first = fs.lock_direct_metadata_mutation().unwrap();
+        let second = fs.lock_direct_metadata_mutation().unwrap();
+        assert_eq!(notifications.load(Ordering::Acquire), 0);
+        drop(first);
+        assert_eq!(notifications.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(notifications.load(Ordering::Acquire), 2);
+
+        let exclusive = fs.lock_transactional_metadata_mutation().unwrap();
+        assert_eq!(notifications.load(Ordering::Acquire), 2);
+        drop(exclusive);
+        assert_eq!(notifications.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
     fn metadata_mutation_barrier_rejects_direct_count_overflow() {
         let fs = make_test_fs(16);
         fs.metadata_mutation_barrier.state.store(

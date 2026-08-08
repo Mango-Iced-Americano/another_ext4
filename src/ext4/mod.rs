@@ -21,6 +21,15 @@ mod xattr_reclaim;
 
 pub use low_level::{InodeOwner, SetAttr};
 
+/// Upper-layer notification hook for metadata-gate progress.
+///
+/// Gate acquisition stays non-blocking because guards span block-device I/O.
+/// An operating-system adapter can use this callback to wake tasks that
+/// observed `EAGAIN` without polling the gate or imposing a global spin lock.
+pub trait MetadataMutationNotifier: Send + Sync {
+    fn notify(&self);
+}
+
 /// Simple fixed-size inode cache.
 /// When full, the entire cache is cleared (simple but effective for common workloads).
 struct InodeCache {
@@ -400,9 +409,18 @@ pub(super) enum MetadataMutationMode {
 /// The top bit denotes an exclusive transactional owner; the remaining bits
 /// count direct writers.  Acquisition never waits for an existing owner, which
 /// is essential because guards intentionally span block-device I/O.
-#[derive(Debug)]
 struct MetadataMutationGate {
     state: AtomicUsize,
+    notifier: spin::RwLock<Option<Arc<dyn MetadataMutationNotifier>>>,
+}
+
+impl core::fmt::Debug for MetadataMutationGate {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("MetadataMutationGate")
+            .field("state", &self.state.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 const METADATA_GATE_EXCLUSIVE: usize = 1usize << (usize::BITS - 1);
@@ -414,6 +432,18 @@ impl MetadataMutationGate {
     const fn new() -> Self {
         Self {
             state: AtomicUsize::new(0),
+            notifier: spin::RwLock::new(None),
+        }
+    }
+
+    fn set_notifier(&self, notifier: Arc<dyn MetadataMutationNotifier>) {
+        *self.notifier.write() = Some(notifier);
+    }
+
+    fn notify_progress(&self) {
+        let notifier = self.notifier.read().clone();
+        if let Some(notifier) = notifier {
+            notifier.notify();
         }
     }
 
@@ -479,6 +509,7 @@ impl Drop for MetadataMutationGuard<'_> {
             let previous = self.gate.state.fetch_sub(1, Ordering::Release);
             debug_assert!(previous > 0 && previous < METADATA_GATE_EXCLUSIVE);
         }
+        self.gate.notify_progress();
     }
 }
 
@@ -487,6 +518,11 @@ const INODE_CACHE_SIZE: usize = 512;
 pub(super) const INODE_MUTATION_LOCK_SHARDS: usize = 64;
 
 impl Ext4 {
+    /// Install an upper-layer wakeup hook for non-blocking metadata admission.
+    pub fn set_metadata_mutation_notifier(&self, notifier: Arc<dyn MetadataMutationNotifier>) {
+        self.metadata_mutation_barrier.set_notifier(notifier);
+    }
+
     pub(super) fn checked_write_logical_range(
         offset: usize,
         len: usize,
