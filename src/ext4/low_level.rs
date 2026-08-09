@@ -1815,11 +1815,6 @@ impl Ext4 {
         new_name: &str,
     ) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
-        // Rename can remove the final name of an overwritten target. Keep the
-        // complete namespace transition in the exclusive domain so a follow-up
-        // transactional orphan/reclaim implementation cannot inherit a stale
-        // direct-writer snapshot window.
-        let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         // The rename transaction has a bounded credit estimate.  Do not let
         // an unrelated deferred writeback batch consume that reservation and
         // turn a normal namespace update into E2BIG.
@@ -1846,6 +1841,17 @@ impl Ext4 {
         if let Some(existing_id) = existing {
             mutation_ids.push(existing_id);
         }
+        // A rename which replaces an existing entry is fully transactional;
+        // a simple rename uses legacy direct directory mutation helpers which
+        // must own the direct side of the metadata gate.  Selecting the gate
+        // after checking the target avoids re-entering the direct side while
+        // holding a transactional guard (which would surface as EAGAIN when
+        // a destination directory needs to grow).
+        let _metadata_guard = if existing.is_some() {
+            self.lock_transactional_metadata_mutation()?
+        } else {
+            self.lock_direct_metadata_mutation()?
+        };
         let _mutation_guards = self.lock_inode_mutations(&mutation_ids);
         parent_ref = self.read_inode(parent)?;
         new_parent_ref = if parent == new_parent {
