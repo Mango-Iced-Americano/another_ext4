@@ -91,6 +91,13 @@ impl StagedBlock {
 /// commit point. Journal commits publish after a durable checkpoint; direct
 /// commits publish after every synchronous home-block write has succeeded.
 pub trait CachePublisher: Send + Sync {
+    /// Publish an in-memory view of a deferred transaction before releasing
+    /// the writer token. The images are not durable yet, but subsequent VFS
+    /// operations must observe the completed mutation. Implementations must
+    /// be infallible and idempotent because the same images are published
+    /// again after their checkpoint becomes durable.
+    fn publish_pending(&self, _blocks: &BTreeMap<PBlockId, StagedBlock>) {}
+
     /// Publish already-checkpointed images to in-memory caches.
     ///
     /// This callback runs after the home-block flush, so it must not allocate,
@@ -221,6 +228,15 @@ impl JournalTransactionCore {
         self.context.lock().deferred_transaction.is_some()
     }
 
+    pub(super) fn deferred_block(&self, home: PBlockId) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        self.context
+            .lock()
+            .deferred_transaction
+            .as_ref()
+            .and_then(|transaction| transaction.staged.get(&home))
+            .cloned()
+    }
+
     /// Start a transaction only when it can extend an existing deferred batch.
     ///
     /// A caller that receives `None` must preserve its normal direct-metadata
@@ -243,7 +259,7 @@ impl JournalTransactionCore {
             return Err(Ext4Error::new(ErrCode::EAGAIN));
         }
 
-        let deferred_staged = {
+        let (deferred_staged, total_credits) = {
             let mut context = self.context.lock();
             let Some(deferred) = context.deferred_transaction.as_ref() else {
                 self.writer.store(false, Ordering::Release);
@@ -270,11 +286,11 @@ impl JournalTransactionCore {
                 self.writer.store(false, Ordering::Release);
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
-            context.deferred_transaction.take()
+            (context.deferred_transaction.take(), total)
         };
         Ok(Some(Transaction::new(
             TransactionCoreRef::Journal(self),
-            credits,
+            total_credits,
             false,
             deferred_staged,
         )))
@@ -317,12 +333,14 @@ impl JournalTransactionCore {
             let total = pending
                 .checked_add(credits)
                 .ok_or_else(|| Ext4Error::new(ErrCode::E2BIG))?;
-            required_log_blocks(total, context.superblock.features).and_then(|needed| {
-                ring_len(&context.superblock).map(|available| needed <= available)
-            })
+            required_log_blocks(total, context.superblock.features)
+                .and_then(|needed| {
+                    ring_len(&context.superblock).map(|available| needed <= available)
+                })
+                .map(|fits| (fits, total))
         };
-        let fits = match reservation {
-            Ok(fits) => fits,
+        let (fits, total_credits) = match reservation {
+            Ok(reservation) => reservation,
             Err(error) => {
                 self.writer.store(false, Ordering::Release);
                 return Err(error);
@@ -335,7 +353,7 @@ impl JournalTransactionCore {
         let deferred_staged = self.context.lock().deferred_transaction.take();
         Ok(Transaction::new(
             TransactionCoreRef::Journal(self),
-            credits,
+            total_credits,
             false,
             deferred_staged,
         ))
@@ -487,7 +505,10 @@ impl<'a> Transaction<'a> {
     /// not consume another credit and subsequent reads observe the replacement.
     pub fn stage(&mut self, home: PBlockId, image: Box<[u8; BLOCK_SIZE]>) -> Result<()> {
         let was_deferred = self.deferred_image(home).is_some();
-        if !self.staged.contains_key(&home) && !was_deferred && self.staged.len() == self.credits {
+        if !self.staged.contains_key(&home)
+            && !was_deferred
+            && self.total_staged_len() >= self.credits
+        {
             return Err(Ext4Error::new(ErrCode::E2BIG));
         }
         self.staged.insert(
@@ -513,7 +534,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<&'tx mut [u8; BLOCK_SIZE]> {
         if !self.staged.contains_key(&home) {
             let deferred = self.deferred_image(home);
-            if deferred.is_none() && self.total_staged_len() == self.credits {
+            if deferred.is_none() && self.total_staged_len() >= self.credits {
                 return Err(Ext4Error::new(ErrCode::E2BIG));
             }
             let (image, original) = match deferred {
@@ -603,12 +624,15 @@ impl<'a> Transaction<'a> {
         }
 
         self.absorb_deferred_staged();
+        let mut context = core.context.lock();
+        debug_assert!(context.deferred_transaction.is_none());
+        // Keep deferred read-through blocked on the context lock until cache
+        // invalidation/publication and ownership transfer are both complete.
+        publisher.publish_pending(&self.staged);
         let staged = core::mem::take(&mut self.staged)
             .into_iter()
             .map(|(home, staged)| (home, staged.image))
             .collect();
-        let mut context = core.context.lock();
-        debug_assert!(context.deferred_transaction.is_none());
         context.deferred_transaction = Some(DeferredTransaction { staged });
         drop(context);
         self.release_writer();
@@ -1335,6 +1359,21 @@ mod tests {
         }
     }
 
+    struct PendingPublisher {
+        pending: AtomicUsize,
+        committed: AtomicUsize,
+    }
+
+    impl CachePublisher for PendingPublisher {
+        fn publish_pending(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
+            self.pending.fetch_add(blocks.len(), Ordering::SeqCst);
+        }
+
+        fn publish(&self, blocks: &BTreeMap<PBlockId, StagedBlock>) {
+            self.committed.fetch_add(blocks.len(), Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn direct_commit_writes_home_blocks_in_order_then_publishes() {
         let device = MemoryDevice::new();
@@ -1784,6 +1823,78 @@ mod tests {
         assert_eq!(device.flushes.load(Ordering::SeqCst), 4);
         assert_eq!(publisher.0.load(Ordering::SeqCst), 2);
         assert!(!core.has_pending_transaction());
+    }
+
+    #[test]
+    fn deferred_batch_publishes_live_view_before_durability() {
+        let device = MemoryDevice::new();
+        let publisher = PendingPublisher {
+            pending: AtomicUsize::new(0),
+            committed: AtomicUsize::new(0),
+        };
+        let core = JournalTransactionCore::new(context_with_ring(
+            TEST_LARGE_JOURNAL_BLOCKS,
+            TEST_LARGE_JOURNAL_BLOCKS - 1,
+        ))
+        .unwrap();
+        let mut transaction = core.start(1).unwrap();
+        transaction.stage(42, Box::new([0xA5; BLOCK_SIZE])).unwrap();
+
+        transaction
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        assert_eq!(publisher.pending.load(Ordering::SeqCst), 1);
+        assert_eq!(publisher.committed.load(Ordering::SeqCst), 0);
+        assert_eq!(core.deferred_block(42).unwrap()[0], 0xA5);
+        assert!(core
+            .flush_deferred_transaction(
+                &device,
+                &publisher,
+                JournalCommitReason::DurabilityBoundary,
+            )
+            .unwrap());
+        assert_eq!(publisher.committed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn extending_deferred_batch_uses_total_credit_limit() {
+        let device = MemoryDevice::new();
+        let publisher = Publisher(AtomicUsize::new(0));
+        let core = JournalTransactionCore::new(context_with_ring(
+            TEST_LARGE_JOURNAL_BLOCKS,
+            TEST_LARGE_JOURNAL_BLOCKS - 1,
+        ))
+        .unwrap();
+
+        let mut first = core.start(2).unwrap();
+        first.stage(42, Box::new([1; BLOCK_SIZE])).unwrap();
+        first.stage(43, Box::new([2; BLOCK_SIZE])).unwrap();
+        first
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        let mut extension = core.start(1).unwrap();
+        extension.stage(44, Box::new([3; BLOCK_SIZE])).unwrap();
+        assert_eq!(
+            extension
+                .stage(45, Box::new([4; BLOCK_SIZE]))
+                .unwrap_err()
+                .code(),
+            ErrCode::E2BIG
+        );
+        extension
+            .defer_or_commit(&device, &publisher, TEST_MAX_FAST_METADATA_IMAGES)
+            .unwrap();
+
+        assert!(core
+            .flush_deferred_transaction(
+                &device,
+                &publisher,
+                JournalCommitReason::DurabilityBoundary,
+            )
+            .unwrap());
+        assert_eq!(publisher.0.load(Ordering::SeqCst), 3);
     }
 
     #[test]

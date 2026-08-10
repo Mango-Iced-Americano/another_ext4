@@ -1,6 +1,8 @@
-use super::Ext4;
+use super::{dir::DirEntryLocation, Ext4};
 use crate::ext4_defs::*;
 use crate::prelude::*;
+
+const MAX_DEFERRED_NAMESPACE_BLOCKS: usize = 256;
 
 /// Whether removing one published namespace entry makes the inode an orphan.
 /// Directories cannot have hard-link aliases: once rmdir/rename has verified
@@ -81,6 +83,7 @@ impl Ext4 {
         parent: &mut InodeRef,
         child: &mut InodeRef,
         name: &str,
+        location: DirEntryLocation,
     ) -> Result<Option<InodeReclaimHandle>> {
         let child_link_cnt = child.inode.link_count();
         // Linux clears an empty directory's link count unconditionally after
@@ -94,9 +97,9 @@ impl Ext4 {
             // the same crash invariant here: after recovery the inode is
             // either still named, or unreachable and discoverable from the
             // on-disk orphan head.
-            let mut transaction =
-                self.transaction_start(if child.inode.is_dir() { 4 } else { 3 })?;
-            self.transaction_dir_remove_entry(&mut transaction, parent, name)?;
+            let mut transaction = self
+                .transaction_start_with_deferred_retry(if child.inode.is_dir() { 4 } else { 3 })?;
+            self.transaction_dir_remove_entry_at(&mut transaction, parent, name, location)?;
 
             if child.inode.is_dir() {
                 parent.inode.set_link_count(parent.inode.link_count() - 1);
@@ -104,7 +107,7 @@ impl Ext4 {
             }
             child.inode.set_link_count(0);
             if self.uses_journal() {
-                let mut sb = self.read_super_block_cached();
+                let mut sb = self.transaction_read_super_block(&transaction)?;
                 self.transaction_orphan_add(&mut transaction, child, &mut sb)?;
             } else {
                 // Linux nojournal mode does not enroll newly unlinked inodes in
@@ -114,7 +117,18 @@ impl Ext4 {
                 self.transaction_stage_inode_with_csum(&mut transaction, child)?;
             }
 
-            if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+            let result = if child.inode.is_dir() {
+                // Parent nlink updates are kept synchronous until directory
+                // lifetime batching has a dedicated consistency test matrix.
+                transaction.commit(self.block_device.as_ref(), self)
+            } else {
+                transaction.defer_or_commit(
+                    self.block_device.as_ref(),
+                    self,
+                    MAX_DEFERRED_NAMESPACE_BLOCKS,
+                )
+            };
+            if let Err(error) = result {
                 // A commit-path failure may make journal state uncertain.  Do
                 // not let legacy direct writers continue after this boundary.
                 self.poison(ErrCode::EIO);

@@ -248,6 +248,24 @@ impl Ext4 {
         }
     }
 
+    /// Start a transaction, committing an existing bounded batch only when
+    /// its accumulated images leave insufficient ring space for this update.
+    pub(super) fn transaction_start_with_deferred_retry(
+        &self,
+        credits: usize,
+    ) -> Result<journal_transaction::Transaction<'_>> {
+        match self.transaction_start(credits) {
+            Err(error)
+                if error.code() == ErrCode::E2BIG
+                    && matches!(&self.metadata_mode, MetadataMutationMode::Journal(_)) =>
+            {
+                self.flush_deferred_journal_for(JournalCommitReason::DeferredThreshold)?;
+                self.transaction_start(credits)
+            }
+            result => result,
+        }
+    }
+
     /// Starts a journal transaction only to extend an already deferred batch.
     /// Direct and empty-journal cases intentionally return `None` so callers
     /// retain their established synchronous metadata behavior.
@@ -415,9 +433,26 @@ impl Ext4 {
             MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => false,
         }
     }
+
+    pub(super) fn deferred_journal_block(
+        &self,
+        block_id: PBlockId,
+    ) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.deferred_block(block_id),
+            MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => None,
+        }
+    }
 }
 
 impl journal_transaction::CachePublisher for Ext4 {
+    fn publish_pending(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
+        // Deferred metadata is the live VFS state even before a durability
+        // boundary. Reuse the idempotent cache publication path so lookups,
+        // inode reads and allocation accounting observe the completed syscall.
+        self.publish(blocks);
+    }
+
     fn publish(&self, blocks: &BTreeMap<PBlockId, journal_transaction::StagedBlock>) {
         // Normal transactions change descriptor counters/checksums, never the
         // validated bitmap/table addresses. Therefore system_metadata_ranges

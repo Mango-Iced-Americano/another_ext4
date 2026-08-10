@@ -1697,12 +1697,6 @@ impl Ext4 {
     pub fn unlink(&self, parent: InodeId, name: &str) -> Result<Option<InodeReclaimHandle>> {
         self.ensure_mutable()?;
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
-        // Namespace deletion may follow a dirty page-cache writeback batch.
-        // Flush that deferred journal image before reserving the unlink
-        // transaction; otherwise the pending images are counted against the
-        // small unlink credit budget and a valid remove can spuriously return
-        // E2BIG when the journal ring is nearly full.
-        self.flush_deferred_journal()?;
         let _namespace_guard = self.namespace_lock.lock();
         let mut parent_ref = self.read_inode(parent)?;
         // Can only unlink from a directory
@@ -1714,17 +1708,15 @@ impl Ext4 {
             );
         }
         // Cannot unlink directory
-        let child_id = self.dir_find_entry(&parent_ref, name)?;
+        let location = self.dir_find_entry_location(&parent_ref, name)?;
+        let child_id = location.inode_id;
         let _mutation_guards = self.lock_inode_mutations(&[parent, child_id]);
         parent_ref = self.read_inode(parent)?;
-        if self.dir_find_entry(&parent_ref, name)? != child_id {
-            return_error!(ErrCode::ENOENT, "Namespace changed during unlink");
-        }
         let mut child = self.read_inode(child_id)?;
         if child.inode.is_dir() {
             return_error!(ErrCode::EISDIR, "Cannot unlink a directory");
         }
-        self.unlink_inode(&mut parent_ref, &mut child, name)
+        self.unlink_inode(&mut parent_ref, &mut child, name, location)
     }
 
     /// Helper: Read and validate parent directories for rename operations.
@@ -2328,12 +2320,10 @@ impl Ext4 {
                 parent_ref.id
             );
         }
-        let child_id = self.dir_find_entry(&parent_ref, name)?;
+        let location = self.dir_find_entry_location(&parent_ref, name)?;
+        let child_id = location.inode_id;
         let _mutation_guards = self.lock_inode_mutations(&[parent, child_id]);
         parent_ref = self.read_inode(parent)?;
-        if self.dir_find_entry(&parent_ref, name)? != child_id {
-            return_error!(ErrCode::ENOENT, "Namespace changed during rmdir");
-        }
         let mut child = self.read_inode(child_id)?;
         // Child must be a directory
         if !child.inode.is_dir() {
@@ -2344,7 +2334,7 @@ impl Ext4 {
             return_error!(ErrCode::ENOTEMPTY, "Directory {} is not empty", child.id);
         }
         // Remove directory entry
-        self.unlink_inode(&mut parent_ref, &mut child, name)
+        self.unlink_inode(&mut parent_ref, &mut child, name, location)
     }
 
     /// Get extended attribute of a file.

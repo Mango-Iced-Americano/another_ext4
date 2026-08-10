@@ -9,6 +9,13 @@ pub(super) enum DirAddFailure {
     Indeterminate(Ext4Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DirEntryLocation {
+    pub(super) inode_id: InodeId,
+    iblock: LBlockId,
+    fblock: PBlockId,
+}
+
 impl DirAddFailure {
     pub(super) fn into_error(self) -> Ext4Error {
         match self {
@@ -198,6 +205,18 @@ impl Ext4 {
 
     /// Find a directory entry that matches a given name under a parent directory
     pub(super) fn dir_find_entry(&self, dir: &InodeRef, name: &str) -> Result<InodeId> {
+        self.dir_find_entry_location(dir, name)
+            .map(|location| location.inode_id)
+    }
+
+    /// Find an entry once and retain its validated directory-block location.
+    /// Namespace callers holding `namespace_lock` can pass this location into
+    /// their transaction instead of rescanning the complete directory.
+    pub(super) fn dir_find_entry_location(
+        &self,
+        dir: &InodeRef,
+        name: &str,
+    ) -> Result<DirEntryLocation> {
         Self::validate_dir_name(name)?;
         trace!("Dir find entry: dir {}, name {}", dir.id, name);
         let total_blocks = Self::dir_data_block_count(dir)?;
@@ -210,8 +229,12 @@ impl Ext4 {
             self.validate_dir_block(dir, iblock, &dir_block)?;
             // Find the entry in block
             let res = dir_block.get(name, self.metadata_csum_enabled());
-            if let Some(r) = res {
-                return Ok(r);
+            if let Some(inode_id) = res {
+                return Ok(DirEntryLocation {
+                    inode_id,
+                    iblock,
+                    fblock,
+                });
             }
             iblock += 1;
         }
@@ -407,6 +430,30 @@ impl Ext4 {
             dir.id,
             name
         );
+    }
+
+    /// Remove an entry from a block located by an earlier validated lookup.
+    /// The transaction view is revalidated and the name must still exist, so
+    /// a corrupt or stale locator fails without staging a namespace change.
+    pub(super) fn transaction_dir_remove_entry_at(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        dir: &InodeRef,
+        name: &str,
+        location: DirEntryLocation,
+    ) -> Result<()> {
+        Self::validate_dir_name(name)?;
+        let view = transaction.read(self.block_device.as_ref(), location.fblock)?;
+        let mut dir_block = DirBlock::new(Block::new(location.fblock, Box::new(*view)));
+        let layout = self.validate_dir_block(dir, location.iblock, &dir_block)?;
+        if layout == DirBlockLayout::Htree
+            || dir_block.get(name, self.metadata_csum_enabled()) != Some(location.inode_id)
+            || !dir_block.remove(name, self.metadata_csum_enabled())
+        {
+            return Err(Ext4Error::new(ErrCode::ENOENT));
+        }
+        self.set_dir_block_checksum(dir, &mut dir_block, layout)?;
+        transaction.stage(location.fblock, dir_block.block().data.clone())
     }
 
     /// Get all entries under a directory

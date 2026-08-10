@@ -106,6 +106,9 @@ impl Ext4 {
 
     /// Read a block from block device
     pub(super) fn read_block(&self, block_id: PBlockId) -> Result<Block> {
+        if let Some(image) = self.deferred_journal_block(block_id) {
+            return Ok(Block::new(block_id, image));
+        }
         self.block_device.read_block(block_id)
     }
 
