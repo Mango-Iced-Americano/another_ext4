@@ -2,7 +2,7 @@ use super::{dir::DirEntryLocation, Ext4};
 use crate::ext4_defs::*;
 use crate::prelude::*;
 
-const MAX_DEFERRED_NAMESPACE_BLOCKS: usize = 256;
+pub(super) const MAX_DEFERRED_NAMESPACE_BLOCKS: usize = 256;
 
 /// Whether removing one published namespace entry makes the inode an orphan.
 /// Directories cannot have hard-link aliases: once rmdir/rename has verified
@@ -12,6 +12,50 @@ pub(super) fn namespace_removal_is_final(is_dir: bool, link_count: u16) -> bool 
 }
 
 impl Ext4 {
+    /// Link a regular inode through the journal and retain the metadata images
+    /// in the current bounded namespace batch. The caller has already ensured
+    /// that the parent contains an insertion slot.
+    pub(super) fn link_inode_transactional(
+        &self,
+        parent: &mut InodeRef,
+        child: &mut InodeRef,
+        name: &str,
+        allow_orphan_relink: bool,
+    ) -> Result<()> {
+        let orphan_relink = child.inode.link_count() == 0 && allow_orphan_relink;
+        if orphan_relink && !self.legacy_orphan_contains(child.id)? {
+            return Err(Ext4Error::new(ErrCode::EINVAL));
+        }
+        if child.inode.is_dir() {
+            return Err(Ext4Error::new(ErrCode::EPERM));
+        }
+
+        let mut transaction =
+            self.transaction_start_with_deferred_retry(if orphan_relink { 3 } else { 2 })?;
+        if orphan_relink {
+            let mut sb = self.transaction_read_super_block(&transaction)?;
+            self.transaction_orphan_del(&mut transaction, child, &mut sb)?;
+            child.inode.set_next_orphan(0);
+        }
+        self.transaction_dir_add_existing(&mut transaction, parent, child, name)?;
+        let new_link_count = child
+            .inode
+            .link_count()
+            .checked_add(1)
+            .ok_or_else(|| Ext4Error::new(ErrCode::EMLINK))?;
+        child.inode.set_link_count(new_link_count);
+        self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+        if let Err(error) = transaction.defer_or_commit(
+            self.block_device.as_ref(),
+            self,
+            MAX_DEFERRED_NAMESPACE_BLOCKS,
+        ) {
+            self.poison(ErrCode::EIO);
+            return Err(error.error);
+        }
+        Ok(())
+    }
+
     /// Link a child inode to a parent directory.
     pub(super) fn link_inode(
         &self,
@@ -140,20 +184,19 @@ impl Ext4 {
             )));
         }
 
-        // Non-final hard-link removal does not create an orphan.  Preserve the
-        // established path until all namespace writers move under JBD2.
-        self.dir_remove_entry(parent, name)?;
-        if child.inode.is_dir() {
-            parent.inode.set_link_count(parent.inode.link_count() - 1);
-            if let Err(error) = self.write_inode_with_csum(parent) {
-                self.poison(ErrCode::EIO);
-                return Err(error);
-            }
-        }
+        // A non-final hard-link removal changes only the directory block and
+        // inode link count, so it can safely share the same bounded batch.
+        let mut transaction = self.transaction_start_with_deferred_retry(2)?;
+        self.transaction_dir_remove_entry_at(&mut transaction, parent, name, location)?;
         child.inode.set_link_count(child_link_cnt - 1);
-        if let Err(error) = self.write_inode_with_csum(child) {
+        self.transaction_stage_inode_with_csum(&mut transaction, child)?;
+        if let Err(error) = transaction.defer_or_commit(
+            self.block_device.as_ref(),
+            self,
+            MAX_DEFERRED_NAMESPACE_BLOCKS,
+        ) {
             self.poison(ErrCode::EIO);
-            return Err(error);
+            return Err(error.error);
         }
         Ok(None)
     }

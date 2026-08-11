@@ -931,13 +931,25 @@ impl Ext4 {
         &self,
         handle: InodeReclaimHandle,
     ) -> core::result::Result<(), InodeReclaimError> {
-        match self.reclaim_inode_inner(&handle) {
+        match self.reclaim_inode_inner(&handle, false) {
             Ok(()) => Ok(()),
             Err(error) => Err(InodeReclaimError::new(error, handle)),
         }
     }
 
-    fn reclaim_inode_inner(&self, handle: &InodeReclaimHandle) -> Result<()> {
+    /// Reclaim the current orphan-list head after a caller validated the full
+    /// chain and retained the corresponding one-shot capability.
+    pub fn reclaim_inode_from_validated_head(
+        &self,
+        handle: InodeReclaimHandle,
+    ) -> core::result::Result<(), InodeReclaimError> {
+        match self.reclaim_inode_inner(&handle, true) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(InodeReclaimError::new(error, handle)),
+        }
+    }
+
+    fn reclaim_inode_inner(&self, handle: &InodeReclaimHandle, validated_head: bool) -> Result<()> {
         self.ensure_mutable()?;
         // Delayed VFS eviction runs after the namespace operation released its
         // guard. Re-enter the transactional domain for the complete multi-
@@ -945,7 +957,12 @@ impl Ext4 {
         let _metadata_guard = self.lock_transactional_metadata_mutation()?;
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(handle.inode_id)].lock();
-        self.reclaim_inode_lifetime(handle.inode_id, handle.generation, self.uses_journal())
+        self.reclaim_inode_lifetime(
+            handle.inode_id,
+            handle.generation,
+            self.uses_journal(),
+            validated_head,
+        )
     }
 
     /// Reclaim a mount-recovery orphan without manufacturing a VFS lifetime
@@ -956,7 +973,7 @@ impl Ext4 {
         let _mutation_guard =
             self.inode_mutation_locks[self.inode_mutation_lock_index(inode_id)].lock();
         let generation = self.read_inode_uncached(inode_id)?.inode.generation();
-        self.reclaim_inode_lifetime(inode_id, generation, true)
+        self.reclaim_inode_lifetime(inode_id, generation, true, false)
     }
 
     /// Complete a crash-interrupted truncate for an inode that still has names.
@@ -982,7 +999,7 @@ impl Ext4 {
                 return_error!(ErrCode::EIO, "Invalid linked truncate orphan {}", inode_id);
             }
             let keep_blocks = inode.inode.size().div_ceil(BLOCK_SIZE as u64);
-            let mut transaction = self.transaction_start(32)?;
+            let mut transaction = self.transaction_start_with_deferred_retry(32)?;
             let Some(tail) = self.extent_tail(&transaction, &inode)? else {
                 transaction.abort();
                 break;
@@ -1033,19 +1050,19 @@ impl Ext4 {
                     .ok_or_else(|| format_error!(ErrCode::EIO, "Invalid inode block count"))?,
             );
             self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
-            self.commit_reclaim_transaction(transaction)?;
+            self.finish_reclaim_transaction(transaction)?;
         }
 
         let mut inode = self.read_inode_uncached(inode_id)?;
         if inode.inode.link_count() == 0 {
             return_error!(ErrCode::EIO, "Linked truncate orphan lost all links");
         }
-        let mut transaction = self.transaction_start(8)?;
+        let mut transaction = self.transaction_start_with_deferred_retry(8)?;
         let mut sb = self.transaction_read_super_block(&transaction)?;
         self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
         inode.inode.set_next_orphan(0);
         self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
-        self.commit_reclaim_transaction(transaction)
+        self.finish_reclaim_transaction(transaction)
     }
 
     fn reclaim_inode_lifetime(
@@ -1053,16 +1070,28 @@ impl Ext4 {
         inode_id: InodeId,
         generation: u32,
         require_orphan_membership: bool,
+        validated_head: bool,
     ) -> Result<()> {
         self.validate_reclaim_inode(inode_id, generation)?;
-        if require_orphan_membership && !self.legacy_orphan_contains(inode_id)? {
-            return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
+        if require_orphan_membership {
+            if validated_head {
+                if self.read_super_block_cached().last_orphan() != inode_id {
+                    return_error!(
+                        ErrCode::EAGAIN,
+                        "Inode {} is no longer orphan head",
+                        inode_id
+                    );
+                }
+            } else if !self.legacy_orphan_contains(inode_id)? {
+                return_error!(ErrCode::EINVAL, "Inode {} is not orphaned", inode_id);
+            }
         }
         // Each iteration starts from the checkpointed inode-table entry.  The
         // on-disk extent root is therefore the restart cursor after any crash.
         // Chain membership was fully validated once above. The metadata write
         // barrier keeps the chain stable, avoiding O(extents * orphan_count)
-        // repeated walks; final orphan_del performs its own bounded walk.
+        // repeated walks. A validated-head batch also removes the final node
+        // in O(1); the generic single-handle path retains the bounded walk.
         loop {
             let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
             if !inode.inode.uses_extents() {
@@ -1072,7 +1101,7 @@ impl Ext4 {
                 break;
             }
 
-            let mut transaction = self.transaction_start(32)?;
+            let mut transaction = self.transaction_start_with_deferred_retry(32)?;
             let Some(tail) = self.extent_tail(&transaction, &inode)? else {
                 break;
             };
@@ -1124,18 +1153,18 @@ impl Ext4 {
                 removed.start_lblock as u64 * BLOCK_SIZE as u64,
             ));
             self.transaction_stage_inode_with_csum(&mut transaction, &mut inode)?;
-            self.commit_reclaim_transaction(transaction)?;
+            self.finish_reclaim_transaction(transaction)?;
         }
 
         // External xattrs form their own restartable transaction. Shared
         // blocks update h_refcount; exclusive blocks also release allocation.
         let mut inode = self.validate_reclaim_inode(inode_id, generation)?;
         if inode.inode.xattr_block() != 0 {
-            let mut transaction = self.transaction_start(16)?;
+            let mut transaction = self.transaction_start_with_deferred_retry(16)?;
             if let Some(block) = self.transaction_release_xattr(&mut transaction, &mut inode)? {
                 self.transaction_dealloc_block_range(&mut transaction, block, 1)?;
             }
-            self.commit_reclaim_transaction(transaction)?;
+            self.finish_reclaim_transaction(transaction)?;
         }
 
         // Only the final transaction makes the orphan undiscoverable. It also
@@ -1153,16 +1182,20 @@ impl Ext4 {
             return_error!(ErrCode::EIO, "Final reclaim with owned blocks");
         }
         let is_dir = inode.inode.is_dir();
-        let mut transaction = self.transaction_start(16)?;
+        let mut transaction = self.transaction_start_with_deferred_retry(16)?;
         if require_orphan_membership {
             let mut sb = self.transaction_read_super_block(&transaction)?;
-            self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+            if validated_head {
+                self.transaction_orphan_del_validated_head(&mut transaction, &inode, &mut sb)?;
+            } else {
+                self.transaction_orphan_del(&mut transaction, &inode, &mut sb)?;
+            }
         }
         self.transaction_dealloc_inode(&mut transaction, inode_id, is_dir)?;
         let mut cleared = InodeRef::new(inode_id, Box::default());
         cleared.inode.set_generation(generation);
         self.transaction_stage_inode_with_csum(&mut transaction, &mut cleared)?;
-        self.commit_reclaim_transaction(transaction)
+        self.finish_reclaim_transaction(transaction)
     }
 
     fn validate_reclaim_inode(&self, inode_id: InodeId, generation: u32) -> Result<InodeRef> {
@@ -1189,11 +1222,15 @@ impl Ext4 {
         Ok(inode)
     }
 
-    fn commit_reclaim_transaction(
+    fn finish_reclaim_transaction(
         &self,
         transaction: super::journal_transaction::Transaction<'_>,
     ) -> Result<()> {
-        if let Err(error) = transaction.commit(self.block_device.as_ref(), self) {
+        if let Err(error) = transaction.defer_or_commit(
+            self.block_device.as_ref(),
+            self,
+            super::link::MAX_DEFERRED_NAMESPACE_BLOCKS,
+        ) {
             self.poison(ErrCode::EIO);
             return Err(error.error);
         }

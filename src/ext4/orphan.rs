@@ -93,6 +93,16 @@ fn validate_chain<R: LegacyOrphanReader>(reader: &R, head: InodeId) -> Result<Le
 }
 
 impl Ext4 {
+    /// Return one fully validated head-to-tail orphan order for a bounded VFS
+    /// reclaim pass. Callers still need to revalidate the current head before
+    /// consuming each one-shot reclaim handle.
+    pub fn validated_orphan_reclaim_order(&self) -> Result<Vec<InodeId>> {
+        if !self.uses_journal() {
+            return Ok(Vec::new());
+        }
+        Ok(self.validate_legacy_orphan_chain()?.inodes)
+    }
+
     /// Verify that `inode_id` is a member of the complete, valid legacy list.
     ///
     /// Reclaim calls this while holding the target inode's mutation shard.  A
@@ -187,6 +197,28 @@ impl Ext4 {
             current = next;
         }
         Err(corruption())
+    }
+
+    /// Remove a target which was part of a previously validated chain and is
+    /// still the current head. This is the O(1) consumption step used by a VFS
+    /// batch; a concurrent namespace mutation changes the head and makes the
+    /// operation fail before staging anything.
+    pub(super) fn transaction_orphan_del_validated_head(
+        &self,
+        transaction: &mut super::journal_transaction::Transaction<'_>,
+        inode: &InodeRef,
+        sb: &mut SuperBlock,
+    ) -> Result<()> {
+        let target = inode.id;
+        let next = inode.inode.next_orphan();
+        if sb.last_orphan() != target
+            || !valid_orphan_number(self, target)
+            || (next != 0 && !valid_orphan_number(self, next))
+        {
+            return Err(corruption());
+        }
+        sb.set_last_orphan(next);
+        self.transaction_stage_super_block(transaction, sb)
     }
 
     /// Reject formats whose orphan state this implementation cannot update.

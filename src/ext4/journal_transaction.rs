@@ -2055,9 +2055,9 @@ mod tests {
     #[test]
     fn commit_flush_failure_never_publishes_or_checkpoints() {
         let device = MemoryDevice::new();
-        // active sb write+flush, descriptor+data writes+flush, commit write,
-        // then fail the commit-point flush (zero-based operation 6).
-        device.fail_at.store(6, Ordering::SeqCst);
+        // active-SB + descriptor/data writes share the first flush, followed
+        // by the commit-record write; fail its flush (zero-based operation 5).
+        device.fail_at.store(5, Ordering::SeqCst);
         let core = JournalTransactionCore::new(context()).unwrap();
         let publisher = Publisher(AtomicUsize::new(0));
         let mut transaction = core.start(1).unwrap();

@@ -118,23 +118,40 @@ impl Ext4 {
     }
 
     pub fn flush_device(&self) -> Result<()> {
-        if matches!(self.metadata_mode, MetadataMutationMode::Journal(_)) {
-            self.flush_deferred_journal_for(JournalCommitReason::DurabilityBoundary)?;
+        if matches!(self.metadata_mode, MetadataMutationMode::Journal(_))
+            && self.flush_deferred_journal_for(JournalCommitReason::DurabilityBoundary)?
+        {
+            // A journal commit already ended with the TailUpdate persistence
+            // boundary. Issuing another device flush here adds no ordering but
+            // makes every deferred durability boundary five flushes instead of
+            // the required four.
+            return Ok(());
         }
         self.flush_device_boundary(JournalCommitReason::DurabilityBoundary)
+    }
+
+    /// Whether journaled metadata is waiting for a durability boundary.
+    pub fn has_deferred_journal(&self) -> bool {
+        match &self.metadata_mode {
+            MetadataMutationMode::Journal(core) => core.has_pending_transaction(),
+            MetadataMutationMode::ReadOnly | MetadataMutationMode::Direct(_) => false,
+        }
     }
 
     /// Commit pending writeback metadata before a durability boundary.
     pub fn flush_deferred_journal(&self) -> Result<()> {
         self.flush_deferred_journal_for(JournalCommitReason::Explicit)
+            .map(|_| ())
     }
 
-    pub(super) fn flush_deferred_journal_for(&self, reason: JournalCommitReason) -> Result<()> {
+    /// Returns true when this call committed a deferred transaction. Such a
+    /// commit already includes its final TailUpdate persistence boundary.
+    pub(super) fn flush_deferred_journal_for(&self, reason: JournalCommitReason) -> Result<bool> {
         let MetadataMutationMode::Journal(core) = &self.metadata_mode else {
-            return Ok(());
+            return Ok(false);
         };
         match core.flush_deferred_transaction(self.block_device.as_ref(), self, reason) {
-            Ok(_) => Ok(()),
+            Ok(committed) => Ok(committed),
             Err(error) => {
                 if error.failure != journal_transaction::CommitFailure::BeforeCommit {
                     self.poison(ErrCode::EIO);
