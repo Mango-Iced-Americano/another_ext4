@@ -23,6 +23,10 @@ pub(super) struct PreparedExtentCache {
     epoch: usize,
     next_slot: usize,
     slots: [Option<PreparedExtent>; PREPARED_EXTENT_SLOTS],
+    hits: usize,
+    misses: usize,
+    overwrites: usize,
+    epoch_invalidations: usize,
 }
 
 impl PreparedExtentCache {
@@ -31,16 +35,25 @@ impl PreparedExtentCache {
             epoch: 0,
             next_slot: 0,
             slots: [None; PREPARED_EXTENT_SLOTS],
+            hits: 0,
+            misses: 0,
+            overwrites: 0,
+            epoch_invalidations: 0,
         }
     }
 
-    fn probe(&self, inode: InodeId, range: &WriteLogicalRange) -> PreparedExtentProbe {
+    fn probe(&mut self, inode: InodeId, range: &WriteLogicalRange) -> PreparedExtentProbe {
         let hit = self.slots.iter().flatten().any(|entry| {
             entry.inode == inode
                 && entry.epoch == self.epoch
                 && entry.first_lblock <= range.first_lblock
                 && range.last_lblock <= entry.last_lblock
         });
+        if hit {
+            self.hits = self.hits.saturating_add(1);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
         PreparedExtentProbe {
             hit,
             token: self.epoch,
@@ -67,6 +80,7 @@ impl PreparedExtentCache {
             .iter_mut()
             .find(|slot| slot.is_some_and(|current| current.inode == inode))
         {
+            self.overwrites = self.overwrites.saturating_add(1);
             *slot = Some(entry);
             return true;
         }
@@ -76,12 +90,22 @@ impl PreparedExtentCache {
     }
 
     fn invalidate(&mut self) {
+        self.epoch_invalidations = self.epoch_invalidations.saturating_add(1);
         if self.epoch == usize::MAX {
             self.epoch = 0;
             self.slots.fill(None);
             return;
         }
         self.epoch += 1;
+    }
+
+    pub(super) fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.hits,
+            self.misses,
+            self.overwrites,
+            self.epoch_invalidations,
+        )
     }
 }
 

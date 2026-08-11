@@ -400,7 +400,7 @@ impl Ext4 {
             }
             let refreshed = self.block_device.read_block(mapping[0])?;
             journal_sb = JournalSuperblock::parse(&refreshed.data[..], BLOCK_SIZE as u32)?;
-            self.inode_cache.lock().entries.clear();
+            self.inode_cache.lock().clear();
         }
 
         let mut image = Box::new([0u8; 1024]);

@@ -35,6 +35,11 @@ pub trait MetadataMutationNotifier: Send + Sync {
 struct InodeCache {
     entries: BTreeMap<InodeId, InodeRef>,
     max_size: usize,
+    hits: usize,
+    misses: usize,
+    full_clears: usize,
+    evicted_entries: usize,
+    high_water: usize,
 }
 
 impl InodeCache {
@@ -42,23 +47,50 @@ impl InodeCache {
         Self {
             entries: BTreeMap::new(),
             max_size,
+            hits: 0,
+            misses: 0,
+            full_clears: 0,
+            evicted_entries: 0,
+            high_water: 0,
         }
     }
 
-    fn get(&self, id: InodeId) -> Option<InodeRef> {
-        self.entries.get(&id).cloned()
+    fn get(&mut self, id: InodeId) -> Option<InodeRef> {
+        match self.entries.get(&id).cloned() {
+            Some(entry) => {
+                self.hits = self.hits.saturating_add(1);
+                Some(entry)
+            }
+            None => {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+        }
     }
 
     fn insert(&mut self, inode_ref: InodeRef) {
         if self.entries.len() >= self.max_size {
             // Simple eviction: clear all when full
+            self.full_clears = self.full_clears.saturating_add(1);
+            self.evicted_entries = self
+                .evicted_entries
+                .saturating_add(self.entries.len());
             self.entries.clear();
         }
         self.entries.insert(inode_ref.id, inode_ref);
+        self.high_water = self.high_water.max(self.entries.len());
     }
 
     fn invalidate(&mut self, id: InodeId) {
         self.entries.remove(&id);
+    }
+
+    fn clear(&mut self) {
+        if !self.entries.is_empty() {
+            self.full_clears = self.full_clears.saturating_add(1);
+            self.evicted_entries = self.evicted_entries.saturating_add(self.entries.len());
+            self.entries.clear();
+        }
     }
 
     /// Update cached entry in-place if it exists. Used after write-back.
@@ -66,6 +98,16 @@ impl InodeCache {
         if self.entries.contains_key(&inode_ref.id) {
             self.entries.insert(inode_ref.id, inode_ref.clone());
         }
+    }
+
+    fn stats(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.hits,
+            self.misses,
+            self.full_clears,
+            self.evicted_entries,
+            self.high_water,
+        )
     }
 }
 
@@ -152,6 +194,15 @@ pub struct PrepareStatsSnapshot {
     pub lock_wait_cycles: usize,
     pub lock_hold_calls: usize,
     pub lock_hold_cycles: usize,
+    pub inode_cache_hits: usize,
+    pub inode_cache_misses: usize,
+    pub inode_cache_full_clears: usize,
+    pub inode_cache_evicted_entries: usize,
+    pub inode_cache_high_water: usize,
+    pub prepared_extent_hits: usize,
+    pub prepared_extent_misses: usize,
+    pub prepared_extent_overwrites: usize,
+    pub prepared_extent_epoch_invalidations: usize,
 }
 
 pub(super) struct WriteLogicalRange {
@@ -369,6 +420,15 @@ impl PrepareStats {
             lock_wait_cycles: self.lock_wait_cycles.load(Ordering::Relaxed),
             lock_hold_calls: self.lock_hold_calls.load(Ordering::Relaxed),
             lock_hold_cycles: self.lock_hold_cycles.load(Ordering::Relaxed),
+            inode_cache_hits: 0,
+            inode_cache_misses: 0,
+            inode_cache_full_clears: 0,
+            inode_cache_evicted_entries: 0,
+            inode_cache_high_water: 0,
+            prepared_extent_hits: 0,
+            prepared_extent_misses: 0,
+            prepared_extent_overwrites: 0,
+            prepared_extent_epoch_invalidations: 0,
         }
     }
 }
@@ -550,7 +610,20 @@ impl Ext4 {
     }
 
     pub fn prepare_stats_snapshot(&self) -> PrepareStatsSnapshot {
-        self.prepare_stats.snapshot()
+        let mut snapshot = self.prepare_stats.snapshot();
+        let (hits, misses, full_clears, evicted_entries, high_water) =
+            self.inode_cache.lock().stats();
+        let prepared = self.prepared_extents.lock().stats();
+        snapshot.inode_cache_hits = hits;
+        snapshot.inode_cache_misses = misses;
+        snapshot.inode_cache_full_clears = full_clears;
+        snapshot.inode_cache_evicted_entries = evicted_entries;
+        snapshot.inode_cache_high_water = high_water;
+        snapshot.prepared_extent_hits = prepared.0;
+        snapshot.prepared_extent_misses = prepared.1;
+        snapshot.prepared_extent_overwrites = prepared.2;
+        snapshot.prepared_extent_epoch_invalidations = prepared.3;
+        snapshot
     }
 
     pub const fn prepare_stats_enabled(&self) -> bool {
